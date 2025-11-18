@@ -28,17 +28,28 @@ func (pb *PromptBuilder) BuildLevelPrompt(
 	level KpvedLevel,
 	candidates []*KpvedNode,
 ) *ClassificationPrompt {
+	return pb.BuildLevelPromptWithType(normalizedName, category, level, candidates, "")
+}
+
+// BuildLevelPromptWithType строит промпт для указанного уровня с учетом типа объекта
+func (pb *PromptBuilder) BuildLevelPromptWithType(
+	normalizedName string,
+	category string,
+	level KpvedLevel,
+	candidates []*KpvedNode,
+	objectType string, // "product", "service", или ""
+) *ClassificationPrompt {
 	switch level {
 	case LevelSection:
-		return pb.buildSectionPrompt(normalizedName, category, candidates)
+		return pb.buildSectionPrompt(normalizedName, category, candidates, objectType)
 	case LevelClass:
-		return pb.buildClassPrompt(normalizedName, category, candidates)
+		return pb.buildClassPrompt(normalizedName, category, candidates, objectType)
 	case LevelSubclass:
-		return pb.buildSubclassPrompt(normalizedName, category, candidates)
+		return pb.buildSubclassPrompt(normalizedName, category, candidates, objectType)
 	case LevelGroup:
-		return pb.buildGroupPrompt(normalizedName, category, candidates)
+		return pb.buildGroupPrompt(normalizedName, category, candidates, objectType)
 	default:
-		return pb.buildSectionPrompt(normalizedName, category, candidates)
+		return pb.buildSectionPrompt(normalizedName, category, candidates, objectType)
 	}
 }
 
@@ -47,6 +58,7 @@ func (pb *PromptBuilder) buildSectionPrompt(
 	normalizedName string,
 	category string,
 	candidates []*KpvedNode,
+	objectType string,
 ) *ClassificationPrompt {
 	// Формируем список секций
 	var sectionsText strings.Builder
@@ -54,26 +66,31 @@ func (pb *PromptBuilder) buildSectionPrompt(
 		sectionsText.WriteString(fmt.Sprintf("- %s: %s\n", candidate.Code, candidate.Name))
 	}
 
-	systemPrompt := fmt.Sprintf(`Ты - эксперт по классификации товаров по КПВЭД.
+	// Добавляем правила разграничения товаров/услуг
+	rulesText := pb.getClassificationRules(objectType)
 
-Выбери ОДИН наиболее подходящий раздел КПВЭД для товара.
+	systemPrompt := fmt.Sprintf(`Ты - эксперт по классификации товаров и услуг по классификатору КПВЭД.
 
-Доступные разделы:
+ОСНОВНЫЕ ПРИНЦИПЫ КЛАССИФИКАЦИИ:
 %s
 
-Правила:
-1. Выбери только ОДИН раздел
-2. Учитывай тип товара и его назначение
-3. Если товар может относиться к нескольким разделам, выбери наиболее специфичный
+РАЗДЕЛЫ КПВЭД:
+%s
 
-Формат ответа - ТОЛЬКО JSON (без markdown кода):
+ИНСТРУКЦИЯ:
+1. Определи физическую природу объекта (товар или услуга)
+2. Выбери наиболее подходящий раздел
+3. Учитывай назначение и функциональные характеристики
+4. Избегай типичных ошибок классификации
+
+Ответь только JSON:
 {
-    "selected_code": "код раздела (одна буква)",
+    "selected_code": "код раздела",
     "confidence": 0.95,
-    "reasoning": "краткое (одно предложение) объяснение выбора"
-}`, sectionsText.String())
+    "reasoning": "краткое объяснение выбора"
+}`, rulesText, sectionsText.String())
 
-	userPrompt := fmt.Sprintf("Товар: %s\nКатегория: %s", normalizedName, category)
+	userPrompt := fmt.Sprintf("Объект: %s\nКатегория: %s", normalizedName, category)
 
 	return &ClassificationPrompt{
 		System: systemPrompt,
@@ -86,6 +103,7 @@ func (pb *PromptBuilder) buildClassPrompt(
 	normalizedName string,
 	category string,
 	candidates []*KpvedNode,
+	objectType string,
 ) *ClassificationPrompt {
 	if len(candidates) == 0 {
 		return &ClassificationPrompt{}
@@ -110,26 +128,24 @@ func (pb *PromptBuilder) buildClassPrompt(
 		classesText.WriteString(fmt.Sprintf("- %s: %s\n", candidate.Code, candidate.Name))
 	}
 
-	systemPrompt := fmt.Sprintf(`Ты - эксперт по классификации товаров по КПВЭД.
+	rulesText := pb.getClassificationRules(objectType)
 
-Выбери ОДИН наиболее подходящий класс в разделе "%s".
+	systemPrompt := fmt.Sprintf(`Выбери класс в разделе "%s".
 
-Доступные классы:
+ПРАВИЛА КЛАССИФИКАЦИИ:
 %s
 
-Правила:
-1. Выбери только ОДИН класс
-2. Класс должен точно соответствовать типу товара
-3. Учитывай специфику и назначение товара
+КЛАССЫ:
+%s
 
-Формат ответа - ТОЛЬКО JSON (без markdown кода):
+Ответь только JSON:
 {
-    "selected_code": "код класса (две цифры)",
+    "selected_code": "код класса",
     "confidence": 0.90,
-    "reasoning": "почему именно этот класс"
-}`, sectionName, classesText.String())
+    "reasoning": "объяснение выбора"
+}`, sectionName, rulesText, classesText.String())
 
-	userPrompt := fmt.Sprintf("Товар: %s\nКатегория: %s", normalizedName, category)
+	userPrompt := fmt.Sprintf("Объект: %s\nКатегория: %s", normalizedName, category)
 
 	return &ClassificationPrompt{
 		System: systemPrompt,
@@ -142,6 +158,7 @@ func (pb *PromptBuilder) buildSubclassPrompt(
 	normalizedName string,
 	category string,
 	candidates []*KpvedNode,
+	objectType string,
 ) *ClassificationPrompt {
 	if len(candidates) == 0 {
 		return &ClassificationPrompt{}
@@ -166,26 +183,24 @@ func (pb *PromptBuilder) buildSubclassPrompt(
 		subclassesText.WriteString(fmt.Sprintf("- %s: %s\n", candidate.Code, candidate.Name))
 	}
 
-	systemPrompt := fmt.Sprintf(`Ты - эксперт по классификации товаров по КПВЭД.
+	rulesText := pb.getClassificationRules(objectType)
 
-Выбери ОДИН наиболее подходящий подкласс в классе "%s".
+	systemPrompt := fmt.Sprintf(`Выбери подкласс в классе "%s".
 
-Доступные подклассы:
+ПРАВИЛА КЛАССИФИКАЦИИ:
 %s
 
-Правила:
-1. Выбери только ОДИН подкласс
-2. Подкласс должен максимально точно описывать товар
-3. Учитывай материал, назначение и особенности товара
+ПОДКЛАССЫ:
+%s
 
-Формат ответа - ТОЛЬКО JSON (без markdown кода):
+Ответь только JSON:
 {
-    "selected_code": "код подкласса (формат XX.Y)",
+    "selected_code": "код подкласса",
     "confidence": 0.85,
-    "reasoning": "почему именно этот подкласс"
-}`, className, subclassesText.String())
+    "reasoning": "объяснение выбора"
+}`, className, rulesText, subclassesText.String())
 
-	userPrompt := fmt.Sprintf("Товар: %s\nКатегория: %s", normalizedName, category)
+	userPrompt := fmt.Sprintf("Объект: %s\nКатегория: %s", normalizedName, category)
 
 	return &ClassificationPrompt{
 		System: systemPrompt,
@@ -198,6 +213,7 @@ func (pb *PromptBuilder) buildGroupPrompt(
 	normalizedName string,
 	category string,
 	candidates []*KpvedNode,
+	objectType string,
 ) *ClassificationPrompt {
 	if len(candidates) == 0 {
 		return &ClassificationPrompt{}
@@ -222,26 +238,24 @@ func (pb *PromptBuilder) buildGroupPrompt(
 		groupsText.WriteString(fmt.Sprintf("- %s: %s\n", candidate.Code, candidate.Name))
 	}
 
-	systemPrompt := fmt.Sprintf(`Ты - эксперт по классификации товаров по КПВЭД.
+	rulesText := pb.getClassificationRules(objectType)
 
-Выбери ОДИН наиболее подходящий код группы в подклассе "%s".
+	systemPrompt := fmt.Sprintf(`Выбери группу в подклассе "%s".
 
-Доступные группы:
+ПРАВИЛА КЛАССИФИКАЦИИ:
 %s
 
-Правила:
-1. Выбери только ОДИН код
-2. Код должен максимально точно соответствовать товару
-3. Это финальный уровень классификации - будь максимально точен
+ГРУППЫ:
+%s
 
-Формат ответа - ТОЛЬКО JSON (без markdown кода):
+Ответь только JSON:
 {
-    "selected_code": "код группы (формат XX.YY или XX.YY.Z)",
+    "selected_code": "код группы",
     "confidence": 0.80,
-    "reasoning": "финальное обоснование выбора"
-}`, subclassName, groupsText.String())
+    "reasoning": "объяснение выбора"
+}`, subclassName, rulesText, groupsText.String())
 
-	userPrompt := fmt.Sprintf("Товар: %s\nКатегория: %s", normalizedName, category)
+	userPrompt := fmt.Sprintf("Объект: %s\nКатегория: %s", normalizedName, category)
 
 	return &ClassificationPrompt{
 		System: systemPrompt,
@@ -252,6 +266,62 @@ func (pb *PromptBuilder) buildGroupPrompt(
 // GetPromptSize возвращает примерный размер промпта в байтах
 func (p *ClassificationPrompt) GetPromptSize() int {
 	return len(p.System) + len(p.User)
+}
+
+// getClassificationRules возвращает универсальные правила классификации
+func (pb *PromptBuilder) getClassificationRules(objectType string) string {
+	rules := strings.Builder{}
+	
+	rules.WriteString("1. РАЗГРАНИЧЕНИЕ ТОВАР/УСЛУГА:\n")
+	rules.WriteString("   - ТОВАРЫ: физические объекты, материалы, оборудование, изделия, комплектующие\n")
+	rules.WriteString("   - УСЛУГИ: работы, действия, консультации, техническое обслуживание, испытания\n")
+	rules.WriteString("   - КРИТИЧНО: если объект является товаром, НЕ выбирай категории услуг (разделы 33-99)\n\n")
+	
+	rules.WriteString("2. ПРИЗНАКИ ТОВАРА (физический объект):\n")
+	rules.WriteString("   - Наличие марки, модели, артикула (например: AKS, HELUKABEL, MQ)\n")
+	rules.WriteString("   - Указание размеров, технических характеристик (диаметр, длина, давление)\n")
+	rules.WriteString("   - Названия материалов, компонентов, элементов (кабель, датчик, панель, элемент)\n")
+	rules.WriteString("   - Возможность поставки, хранения, инвентаризации\n\n")
+	
+	rules.WriteString("3. ПРИЗНАКИ УСЛУГИ (действие, работа):\n")
+	rules.WriteString("   - Описание действий (монтаж, установка, ремонт, испытание, консультация)\n")
+	rules.WriteString("   - Упоминание работ, услуг, обслуживания\n")
+	rules.WriteString("   - Отсутствие физических характеристик товара\n\n")
+	
+	rules.WriteString("4. ТИПИЧНЫЕ ОШИБКИ (ИЗБЕГАТЬ):\n")
+	rules.WriteString("   - Классифицировать оборудование/датчики как услуги по испытаниям\n")
+	rules.WriteString("   - Классифицировать материалы/компоненты как прочие услуги\n")
+	rules.WriteString("   - Классифицировать кабели как электронные платы\n")
+	rules.WriteString("   - Классифицировать строительные элементы как прочие изделия\n\n")
+	
+	rules.WriteString("5. ПРАВИЛА КЛАССИФИКАЦИИ СТРОИТЕЛЬНЫХ МАТЕРИАЛОВ:\n")
+	rules.WriteString("   - СЭНДВИЧ-ПАНЕЛИ (металлическая обшивка + утеплитель):\n")
+	rules.WriteString("     * Содержат \"isowall\", \"сэндвич\", \"sandwich\", \"isopan\" → 25.11.1 (Металлические конструкции)\n")
+	rules.WriteString("     * НЕ относятся к 23.69.19 (Изделия из гипса, бетона или цемента)\n")
+	rules.WriteString("     * Это многослойные конструкции с металлической обшивкой\n")
+	rules.WriteString("   - ИЗДЕЛИЯ ИЗ МИНЕРАЛЬНЫХ МАТЕРИАЛОВ (гипс, бетон, цемент):\n")
+	rules.WriteString("     * Только если основной материал гипс/бетон/цемент\n")
+	rules.WriteString("     * Сэндвич-панели с минеральной ватой НЕ относятся сюда\n")
+	rules.WriteString("   - КОНСТРУКЦИОННЫЕ ПАНЕЛИ:\n")
+	rules.WriteString("     * Металлические конструкции → 25.11.1\n")
+	rules.WriteString("     * Пластмассовые → 23.62.1\n")
+	rules.WriteString("     * Из минеральных материалов → 23.69.19\n\n")
+	
+	rules.WriteString("6. ПРИМЕРЫ ПРАВИЛЬНОЙ КЛАССИФИКАЦИИ:\n")
+	rules.WriteString("   - \"кабель контрольный helukabel\" → Кабели (27.32), НЕ Платы (26.12)\n")
+	rules.WriteString("   - \"преобразователь давления aks\" → Приборы измерения (26.51), НЕ Услуги испытаний (71.20)\n")
+	rules.WriteString("   - \"фасонные элементы для панелей\" → Строительные изделия (23.62/25.11), НЕ Услуги (96.09)\n")
+	rules.WriteString("   - \"болт м10\" → Метизы (25.93), НЕ Услуги\n")
+	rules.WriteString("   - \"панель isowall box\" → Металлические конструкции (25.11.1), НЕ Изделия из гипса (23.69.19)\n")
+	rules.WriteString("   - \"сэндвич панель\" → Металлические конструкции (25.11.1), НЕ Изделия из гипса (23.69.19)\n\n")
+	
+	if objectType == "product" {
+		rules.WriteString("ВАЖНО: Объект определен как ТОВАР. Исключи все категории услуг из рассмотрения.\n")
+	} else if objectType == "service" {
+		rules.WriteString("ВАЖНО: Объект определен как УСЛУГА. Выбирай только категории услуг.\n")
+	}
+	
+	return rules.String()
 }
 
 // FormatForAPI форматирует промпт для отправки в API

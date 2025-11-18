@@ -154,11 +154,6 @@ func InitSchema(db *sql.DB) error {
 		return fmt.Errorf("failed to create normalized_item_attributes table: %w", err)
 	}
 
-	// Создаем таблицу классификатора КПВЭД
-	if err := CreateKpvedClassifierTable(db); err != nil {
-		return fmt.Errorf("failed to create kpved_classifier table: %w", err)
-	}
-
 	// Добавляем КПВЭД поля в normalized_data
 	if err := MigrateNormalizedDataKpvedFields(db); err != nil {
 		return fmt.Errorf("failed to migrate KPVED fields: %w", err)
@@ -227,7 +222,7 @@ func MigrateUploadsTable(db *sql.DB) error {
 			errStr := strings.ToLower(err.Error())
 			// Проверяем, что это не ошибка "duplicate column name" или "already exists"
 			if !strings.Contains(errStr, "duplicate column") &&
-			   !strings.Contains(errStr, "already exists") {
+				!strings.Contains(errStr, "already exists") {
 				return fmt.Errorf("migration failed: %s, error: %w", migration, err)
 			}
 		}
@@ -260,9 +255,9 @@ func MigrateNomenclatureFields(db *sql.DB) error {
 		if err != nil {
 			errStr := strings.ToLower(err.Error())
 			// Проверяем, что это не ошибка "duplicate column name" или "already exists"
-			if !strings.Contains(errStr, "duplicate column") && 
-			   !strings.Contains(errStr, "already exists") &&
-			   !strings.Contains(errStr, "duplicate index") {
+			if !strings.Contains(errStr, "duplicate column") &&
+				!strings.Contains(errStr, "already exists") &&
+				!strings.Contains(errStr, "duplicate index") {
 				return fmt.Errorf("migration failed: %s, error: %w", migration, err)
 			}
 		}
@@ -332,6 +327,13 @@ func CreateNormalizedDataTable(db *sql.DB) error {
 
 		// Для проверки дубликатов по коду (используется в filterDuplicatesFromBatch)
 		`CREATE INDEX IF NOT EXISTS idx_code ON normalized_data(code)`,
+
+		// Оптимизация для запросов групп без КПВЭД классификации
+		// Индекс для быстрого поиска групп без kpved_code
+		`CREATE INDEX IF NOT EXISTS idx_normalized_name_category_kpved ON normalized_data(normalized_name, category, kpved_code)`,
+
+		// Индекс для обновления по normalized_name и category
+		`CREATE INDEX IF NOT EXISTS idx_name_category_update ON normalized_data(normalized_name, category, kpved_code, kpved_name)`,
 	}
 
 	for _, indexSQL := range indexes {
@@ -419,8 +421,8 @@ func MigrateNormalizedDataAIFields(db *sql.DB) error {
 			errStr := strings.ToLower(err.Error())
 			// Проверяем, что это не ошибка "duplicate column name" или "already exists"
 			if !strings.Contains(errStr, "duplicate column") &&
-			   !strings.Contains(errStr, "already exists") &&
-			   !strings.Contains(errStr, "duplicate index") {
+				!strings.Contains(errStr, "already exists") &&
+				!strings.Contains(errStr, "duplicate index") {
 				return fmt.Errorf("migration failed: %s, error: %w", migration, err)
 			}
 		}
@@ -563,6 +565,21 @@ func InitServiceSchema(db *sql.DB) error {
 
 	-- Индекс для оптимизации
 	CREATE INDEX IF NOT EXISTS idx_worker_config_updated_at ON worker_config(updated_at);
+
+	-- Таблица классификатора КПВЭД
+	CREATE TABLE IF NOT EXISTS kpved_classifier (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		code TEXT NOT NULL UNIQUE,
+		name TEXT NOT NULL,
+		parent_code TEXT,
+		level INTEGER,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);
+
+	-- Индексы для таблицы kpved_classifier
+	CREATE INDEX IF NOT EXISTS idx_kpved_code ON kpved_classifier(code);
+	CREATE INDEX IF NOT EXISTS idx_kpved_parent ON kpved_classifier(parent_code);
+	CREATE INDEX IF NOT EXISTS idx_kpved_level ON kpved_classifier(level);
 	`
 
 	_, err := db.Exec(schema)
@@ -643,8 +660,8 @@ func MigrateNormalizedDataKpvedFields(db *sql.DB) error {
 			errStr := strings.ToLower(err.Error())
 			// Проверяем, что это не ошибка "duplicate column name" или "already exists"
 			if !strings.Contains(errStr, "duplicate column") &&
-			   !strings.Contains(errStr, "already exists") &&
-			   !strings.Contains(errStr, "duplicate index") {
+				!strings.Contains(errStr, "already exists") &&
+				!strings.Contains(errStr, "duplicate index") {
 				return fmt.Errorf("migration failed: %s, error: %w", migration, err)
 			}
 		}
@@ -658,6 +675,7 @@ func MigrateNormalizedDataQualityFields(db *sql.DB) error {
 	migrations := []string{
 		`ALTER TABLE normalized_data ADD COLUMN quality_score REAL DEFAULT 0.0`,
 		`ALTER TABLE normalized_data ADD COLUMN validation_status TEXT DEFAULT ''`,
+		`ALTER TABLE normalized_data ADD COLUMN validation_reason TEXT`,
 		`CREATE INDEX IF NOT EXISTS idx_normalized_quality_score ON normalized_data(quality_score)`,
 		`CREATE INDEX IF NOT EXISTS idx_normalized_validation_status ON normalized_data(validation_status)`,
 	}
@@ -669,8 +687,8 @@ func MigrateNormalizedDataQualityFields(db *sql.DB) error {
 			errStr := strings.ToLower(err.Error())
 			// Проверяем, что это не ошибка "duplicate column name" или "already exists"
 			if !strings.Contains(errStr, "duplicate column") &&
-			   !strings.Contains(errStr, "already exists") &&
-			   !strings.Contains(errStr, "duplicate index") {
+				!strings.Contains(errStr, "already exists") &&
+				!strings.Contains(errStr, "duplicate index") {
 				return fmt.Errorf("migration failed: %s, error: %w", migration, err)
 			}
 		}
@@ -1037,4 +1055,3 @@ func CreateSnapshotNormalizedDataTable(db *sql.DB) error {
 
 	return nil
 }
-

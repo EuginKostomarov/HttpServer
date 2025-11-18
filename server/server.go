@@ -59,8 +59,14 @@ type Server struct {
 	qualityAnalysisMutex   sync.RWMutex
 	qualityAnalysisStatus  QualityAnalysisStatus
 	// KPVED классификация
-	hierarchicalClassifier  *normalization.HierarchicalClassifier
-	kpvedClassifierMutex    sync.RWMutex
+	hierarchicalClassifier *normalization.HierarchicalClassifier
+	kpvedClassifierMutex   sync.RWMutex
+	// Отслеживание текущих задач КПВЭД классификации
+	kpvedCurrentTasks      map[int]*classificationTask // workerID -> текущая задача
+	kpvedCurrentTasksMutex sync.RWMutex
+	// Флаг остановки воркеров КПВЭД классификации
+	kpvedWorkersStopped   bool
+	kpvedWorkersStopMutex sync.RWMutex
 }
 
 // QualityAnalysisStatus статус анализа качества
@@ -102,14 +108,15 @@ func NewServerWithConfig(db *database.DB, normalizedDB *database.DB, serviceDB *
 		MaxRetries:     3,
 	}
 
-	// Создаем нормализатор
-	normalizer := normalization.NewNormalizer(db, normalizerEvents, aiConfig)
+	// Создаем менеджер конфигурации воркеров ПЕРЕД нормализатором
+	// чтобы передать его в normalizer для получения API ключа из БД
+	workerConfigManager := NewWorkerConfigManager(serviceDB)
+
+	// Создаем нормализатор с передачей workerConfigManager
+	normalizer := normalization.NewNormalizer(db, normalizerEvents, aiConfig, workerConfigManager)
 
 	// Создаем анализатор качества
 	qualityAnalyzer := quality.NewQualityAnalyzer(db)
-
-	// Создаем менеджер конфигурации воркеров
-	workerConfigManager := NewWorkerConfigManager(serviceDB)
 
 	// Создаем клиент Arliai и кеш
 	arliaiClient := NewArliaiClient()
@@ -125,19 +132,24 @@ func NewServerWithConfig(db *database.DB, normalizedDB *database.DB, serviceDB *
 		model = "GLM-4.5-Air" // По умолчанию
 	}
 
-	if apiKey != "" {
+	if apiKey != "" && serviceDB != nil {
 		aiClient := nomenclature.NewAIClient(apiKey, model)
 		var err error
-		hierarchicalClassifier, err = normalization.NewHierarchicalClassifier(normalizedDB, aiClient)
+		hierarchicalClassifier, err = normalization.NewHierarchicalClassifier(serviceDB, aiClient)
 		if err != nil {
 			log.Printf("Warning: Failed to initialize KPVED classifier: %v", err)
-			log.Printf("KPVED classification will be disabled. Run 'go run cmd/load_kpved/main.go' to load classifier.")
+			log.Printf("KPVED classification will be disabled. Load classifier via /api/kpved/load-from-file endpoint.")
 			hierarchicalClassifier = nil
 		} else {
 			log.Printf("KPVED hierarchical classifier initialized successfully")
 		}
 	} else {
-		log.Printf("Warning: ARLIAI_API_KEY not set. KPVED classification will be disabled.")
+		if apiKey == "" {
+			log.Printf("Warning: ARLIAI_API_KEY not set. KPVED classification will be disabled.")
+		}
+		if serviceDB == nil {
+			log.Printf("Warning: ServiceDB not initialized. KPVED classification will be disabled.")
+		}
 	}
 
 	return &Server{
@@ -160,6 +172,8 @@ func NewServerWithConfig(db *database.DB, normalizedDB *database.DB, serviceDB *
 		arliaiClient:            arliaiClient,
 		arliaiCache:             arliaiCache,
 		hierarchicalClassifier:  hierarchicalClassifier,
+		kpvedCurrentTasks:       make(map[int]*classificationTask),
+		kpvedWorkersStopped:     false,
 	}
 }
 
@@ -174,10 +188,15 @@ func (s *Server) Start() error {
 	// Получаем настроенный handler
 	handler := s.setupMux()
 
-	// Создаем HTTP сервер
+	// Создаем HTTP сервер с увеличенными таймаутами для длительных операций
+	// ReadTimeout и WriteTimeout установлены для защиты от зависших соединений
+	// Но для операций классификации КПВЭД нужны большие значения
 	s.httpServer = &http.Server{
-		Addr:    ":" + s.config.Port,
-		Handler: handler,
+		Addr:         ":" + s.config.Port,
+		Handler:      handler,
+		ReadTimeout:  30 * time.Minute,  // Увеличен для длительных операций классификации
+		WriteTimeout: 30 * time.Minute,  // Увеличен для длительных операций классификации
+		IdleTimeout:  120 * time.Second, // Таймаут для idle соединений
 	}
 
 	// Запускаем сервер
@@ -267,10 +286,27 @@ func (s *Server) setupMux() http.Handler {
 	mux.HandleFunc("/api/kpved/search", s.handleKpvedSearch)
 	mux.HandleFunc("/api/kpved/stats", s.handleKpvedStats)
 	mux.HandleFunc("/api/kpved/load", s.handleKpvedLoad)
+	mux.HandleFunc("/api/kpved/load-from-file", s.handleKpvedLoadFromFile)
 	mux.HandleFunc("/api/kpved/classify-test", s.handleKpvedClassifyTest)
 	mux.HandleFunc("/api/kpved/classify-hierarchical", s.handleKpvedClassifyHierarchical)
 	mux.HandleFunc("/api/kpved/reclassify", s.handleKpvedReclassify)
 	mux.HandleFunc("/api/kpved/reclassify-hierarchical", s.handleKpvedReclassifyHierarchical)
+	mux.HandleFunc("/api/kpved/current-tasks", s.handleKpvedCurrentTasks)
+
+	// Регистрируем эндпоинты для управления классификацией
+	mux.HandleFunc("/api/kpved/reset", s.handleResetClassification)
+	mux.HandleFunc("/api/kpved/reset-all", s.handleResetAllClassification)
+	mux.HandleFunc("/api/kpved/reset-by-code", s.handleResetByCode)
+	mux.HandleFunc("/api/kpved/reset-low-confidence", s.handleResetLowConfidence)
+	mux.HandleFunc("/api/kpved/mark-incorrect", s.handleMarkIncorrect)
+	mux.HandleFunc("/api/kpved/mark-correct", s.handleMarkCorrect)
+	mux.HandleFunc("/api/kpved/workers/status", s.handleKpvedWorkersStatus)
+	mux.HandleFunc("/api/kpved/workers/stop", s.handleKpvedWorkersStop)
+	mux.HandleFunc("/api/kpved/workers/resume", s.handleKpvedWorkersResume)
+	mux.HandleFunc("/api/kpved/workers/start", s.handleKpvedWorkersResume)
+	mux.HandleFunc("/api/kpved/stats/classification", s.handleKpvedStatsGeneral)
+	mux.HandleFunc("/api/kpved/stats/by-category", s.handleKpvedStatsByCategory)
+	mux.HandleFunc("/api/kpved/stats/incorrect", s.handleKpvedStatsIncorrect)
 
 	// Регистрируем эндпоинты для качества нормализации
 	mux.HandleFunc("/api/quality/stats", s.handleQualityStats)
@@ -2992,14 +3028,15 @@ func (s *Server) handleNormalizeStart(w http.ResponseWriter, r *http.Request) {
 			RateLimitDelay: 100 * time.Millisecond,
 			MaxRetries:     3,
 		}
-		normalizerToUse = normalization.NewNormalizer(tempDB, s.normalizerEvents, aiConfig)
+		// Передаем workerConfigManager для получения API ключа из БД
+		normalizerToUse = normalization.NewNormalizer(tempDB, s.normalizerEvents, aiConfig, s.workerConfigManager)
 		normalizerToUse.SetSourceConfig(
 			config.SourceTable,
 			config.ReferenceColumn,
 			config.CodeColumn,
 			config.NameColumn,
 		)
-		log.Printf("Создан временный normalizer для БД: %s", req.Database)
+		log.Printf("Создан временный normalizer для БД: %s (с WorkerConfigManager)", req.Database)
 	} else {
 		// Используем стандартный normalizer
 		normalizerToUse = s.normalizer
@@ -3081,7 +3118,7 @@ func (s *Server) handleNormalizeStart(w http.ResponseWriter, r *http.Request) {
 					rows, err := dbToUse.Query(`
 						SELECT id, normalized_name, category
 						FROM normalized_data
-						WHERE kpved_code IS NULL OR kpved_code = ''
+						WHERE (kpved_code IS NULL OR kpved_code = '' OR TRIM(kpved_code) = '')
 					`)
 					if err != nil {
 						log.Printf("Ошибка получения записей для КПВЭД классификации: %v", err)
@@ -3232,20 +3269,20 @@ func (s *Server) handleNormalizationEvents(w http.ResponseWriter, r *http.Reques
 
 // NormalizationStatus представляет статус процесса нормализации
 type NormalizationStatus struct {
-	IsRunning      bool     `json:"isRunning"`
-	Progress       float64  `json:"progress"`
-	Processed      int      `json:"processed"`
-	Total          int      `json:"total"`
-	Success        int      `json:"success,omitempty"`
-	Errors         int      `json:"errors,omitempty"`
-	CurrentStep    string   `json:"currentStep"`
-	Logs           []string `json:"logs"`
-	StartTime      string   `json:"startTime,omitempty"`
-	ElapsedTime    string   `json:"elapsedTime,omitempty"`
-	Rate           float64  `json:"rate,omitempty"` // записей в секунду
-	KpvedClassified int     `json:"kpvedClassified,omitempty"` // количество классифицированных по КПВЭД
-	KpvedTotal      int     `json:"kpvedTotal,omitempty"`      // общее количество записей для КПВЭД
-	KpvedProgress   float64 `json:"kpvedProgress,omitempty"`    // процент классифицированных по КПВЭД
+	IsRunning       bool     `json:"isRunning"`
+	Progress        float64  `json:"progress"`
+	Processed       int      `json:"processed"`
+	Total           int      `json:"total"`
+	Success         int      `json:"success,omitempty"`
+	Errors          int      `json:"errors,omitempty"`
+	CurrentStep     string   `json:"currentStep"`
+	Logs            []string `json:"logs"`
+	StartTime       string   `json:"startTime,omitempty"`
+	ElapsedTime     string   `json:"elapsedTime,omitempty"`
+	Rate            float64  `json:"rate,omitempty"`            // записей в секунду
+	KpvedClassified int      `json:"kpvedClassified,omitempty"` // количество классифицированных групп по КПВЭД
+	KpvedTotal      int      `json:"kpvedTotal,omitempty"`      // общее количество групп для КПВЭД
+	KpvedProgress   float64  `json:"kpvedProgress,omitempty"`   // процент классифицированных групп по КПВЭД
 }
 
 // handleNormalizationStatus возвращает текущий статус нормализации
@@ -3263,34 +3300,50 @@ func (s *Server) handleNormalizationStatus(w http.ResponseWriter, r *http.Reques
 	errors := s.normalizerErrors
 	s.normalizerMutex.RUnlock()
 
+	// Получаем реальное количество записей в catalog_items для расчета total
+	var totalCatalogItems int
+	err := s.db.QueryRow("SELECT COUNT(*) FROM catalog_items").Scan(&totalCatalogItems)
+	if err != nil {
+		// Если не удалось получить, используем значение по умолчанию
+		log.Printf("Ошибка получения количества записей из catalog_items: %v", err)
+		totalCatalogItems = 0
+	}
+
 	// Получаем количество записей в normalized_data
 	var totalNormalized int
-	err := s.db.QueryRow("SELECT COUNT(*) FROM normalized_data").Scan(&totalNormalized)
+	err = s.db.QueryRow("SELECT COUNT(*) FROM normalized_data").Scan(&totalNormalized)
 	if err != nil {
 		// Таблица может не существовать или быть пустой - это нормально
 		log.Printf("Ошибка получения количества нормализованных записей: %v", err)
 		totalNormalized = 0
 	}
 
-	// Получаем метрики КПВЭД классификации
+	// Получаем метрики КПВЭД классификации (считаем группы, а не записи)
+	// ВАЖНО: normalized_data находится в основной БД (s.db), а не в normalizedDB
 	var kpvedClassified, kpvedTotal int
 	var kpvedProgress float64
-	
-	// Определяем какую БД использовать для КПВЭД метрик
-	dbForKpved := s.normalizedDB
-	if dbForKpved != nil {
-		err = dbForKpved.QueryRow("SELECT COUNT(*) FROM normalized_data WHERE kpved_code IS NOT NULL AND kpved_code != ''").Scan(&kpvedClassified)
+	if s.db != nil {
+		// Считаем количество групп с классификацией КПВЭД
+		err = s.db.QueryRow(`
+			SELECT COUNT(DISTINCT normalized_name || '|' || category)
+			FROM normalized_data
+			WHERE kpved_code IS NOT NULL AND kpved_code != '' AND TRIM(kpved_code) != ''
+		`).Scan(&kpvedClassified)
 		if err != nil {
 			log.Printf("Ошибка получения количества классифицированных по КПВЭД: %v", err)
 			kpvedClassified = 0
 		}
-		
-		err = dbForKpved.QueryRow("SELECT COUNT(*) FROM normalized_data").Scan(&kpvedTotal)
+
+		// Считаем общее количество групп
+		err = s.db.QueryRow(`
+			SELECT COUNT(DISTINCT normalized_name || '|' || category)
+			FROM normalized_data
+		`).Scan(&kpvedTotal)
 		if err != nil {
-			log.Printf("Ошибка получения общего количества записей для КПВЭД: %v", err)
+			log.Printf("Ошибка получения общего количества групп для КПВЭД: %v", err)
 			kpvedTotal = 0
 		}
-		
+
 		if kpvedTotal > 0 {
 			kpvedProgress = float64(kpvedClassified) / float64(kpvedTotal) * 100
 		}
@@ -3301,23 +3354,36 @@ func (s *Server) handleNormalizationStatus(w http.ResponseWriter, r *http.Reques
 		processed = totalNormalized
 	}
 
+	// Используем реальное количество записей из catalog_items для расчета total
+	// Если totalCatalogItems = 0, используем processed как total (для случая когда БД пустая)
+	total := totalCatalogItems
+	if total == 0 && processed > 0 {
+		total = processed
+	}
+
 	// Проверяем, действительно ли процесс завершился
-	// Если прогресс 100% и процесс "запущен", но прошло много времени без обновлений - считаем завершенным
 	progressPercent := 0.0
-	if processed > 0 {
-		progressPercent = float64(processed) / float64(15973) * 100
+	if total > 0 {
+		progressPercent = float64(processed) / float64(total) * 100
 		if progressPercent > 100 {
 			progressPercent = 100
 		}
 	}
 
-	// Если прогресс 100% и процесс "запущен", но нет активности - завершаем
-	if isRunning && progressPercent >= 100 {
-		// Проверяем, не прошло ли слишком много времени с последнего обновления
+	// Если processed >= total, процесс завершен
+	if isRunning && total > 0 && processed >= total {
+		// Завершаем процесс сразу, если все записи обработаны
+		s.normalizerMutex.Lock()
+		s.normalizerRunning = false
+		s.normalizerMutex.Unlock()
+		isRunning = false
+		progressPercent = 100.0
+	} else if isRunning && progressPercent >= 100 {
+		// Если прогресс 100% и процесс "запущен", но нет активности - завершаем через таймаут
 		if !startTime.IsZero() {
 			elapsed := time.Since(startTime)
-			// Если прошло более 30 секунд и прогресс 100%, считаем завершенным
-			if elapsed > 30*time.Second {
+			// Если прошло более 10 секунд и прогресс 100%, считаем завершенным
+			if elapsed > 10*time.Second {
 				s.normalizerMutex.Lock()
 				s.normalizerRunning = false
 				s.normalizerMutex.Unlock()
@@ -3327,14 +3393,14 @@ func (s *Server) handleNormalizationStatus(w http.ResponseWriter, r *http.Reques
 	}
 
 	status := NormalizationStatus{
-		IsRunning:      isRunning,
-		Progress:       progressPercent,
-		Processed:      processed,
-		Total:          15973,
-		Success:        success,
-		Errors:         errors,
-		CurrentStep:    "Не запущено",
-		Logs:           []string{},
+		IsRunning:       isRunning,
+		Progress:        progressPercent,
+		Processed:       processed,
+		Total:           total,
+		Success:         success,
+		Errors:          errors,
+		CurrentStep:     "Не запущено",
+		Logs:            []string{},
 		KpvedClassified: kpvedClassified,
 		KpvedTotal:      kpvedTotal,
 		KpvedProgress:   kpvedProgress,
@@ -3475,11 +3541,11 @@ func (s *Server) handleNormalizationStats(w http.ResponseWriter, r *http.Request
 	}
 
 	stats := map[string]interface{}{
-		"totalItems":              totalItems,              // Количество исправленных элементов
+		"totalItems":               totalItems,               // Количество исправленных элементов
 		"totalItemsWithAttributes": totalItemsWithAttributes, // Количество элементов с извлеченными атрибутами
-		"totalGroups":             uniqueGroups,           // Количество уникальных групп (для совместимости)
-		"categories":              categoryStats,
-		"mergedItems":             mergedItems,            // Количество объединенных дубликатов
+		"totalGroups":              uniqueGroups,             // Количество уникальных групп (для совместимости)
+		"categories":               categoryStats,
+		"mergedItems":              mergedItems, // Количество объединенных дубликатов
 	}
 
 	// Добавляем timestamp последней нормализации, если он есть
@@ -6847,27 +6913,8 @@ func (s *Server) handleKpvedHierarchy(w http.ResponseWriter, r *http.Request) {
 	// Получаем параметры
 	parentCode := r.URL.Query().Get("parent")
 	level := r.URL.Query().Get("level")
-	dbPath := r.URL.Query().Get("database")
-
-	// Определяем, какую БД использовать
-	var db *sql.DB
-
-	if dbPath != "" {
-		// Открываем временное соединение к указанной БД
-		conn, err := sql.Open("sqlite3", dbPath)
-		if err != nil {
-			log.Printf("Error opening database %s: %v", dbPath, err)
-			s.writeJSONError(w, fmt.Sprintf("Failed to open database: %v", err), http.StatusInternalServerError)
-			return
-		}
-		db = conn
-		defer conn.Close()
-	} else {
-		// Используем текущую БД
-		s.dbMutex.RLock()
-		db = s.db.GetDB()
-		s.dbMutex.RUnlock()
-	}
+	// Используем сервисную БД для классификатора КПВЭД
+	db := s.serviceDB.GetDB()
 
 	// Строим запрос
 	query := "SELECT code, name, parent_code, level FROM kpved_classifier WHERE 1=1"
@@ -6882,8 +6929,9 @@ func (s *Server) handleKpvedHierarchy(w http.ResponseWriter, r *http.Request) {
 		levelInt, _ := strconv.Atoi(level)
 		args = append(args, levelInt)
 	} else {
-		// По умолчанию показываем верхний уровень (секции A-Z)
-		query += " AND level = 0"
+		// По умолчанию показываем верхний уровень (секции A-Z, level = 1)
+		// Секции имеют parent_code = NULL или parent_code = ''
+		query += " AND level = 1 AND (parent_code IS NULL OR parent_code = '')"
 	}
 
 	query += " ORDER BY code"
@@ -6958,27 +7006,8 @@ func (s *Server) handleKpvedSearch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	dbPath := r.URL.Query().Get("database")
-
-	// Определяем, какую БД использовать
-	var db *sql.DB
-
-	if dbPath != "" {
-		// Открываем временное соединение к указанной БД
-		conn, err := sql.Open("sqlite3", dbPath)
-		if err != nil {
-			log.Printf("Error opening database %s: %v", dbPath, err)
-			s.writeJSONError(w, fmt.Sprintf("Failed to open database: %v", err), http.StatusInternalServerError)
-			return
-		}
-		db = conn
-		defer conn.Close()
-	} else {
-		// Используем текущую БД
-		s.dbMutex.RLock()
-		db = s.db.GetDB()
-		s.dbMutex.RUnlock()
-	}
+	// Используем сервисную БД для классификатора КПВЭД
+	db := s.serviceDB.GetDB()
 
 	query := `
 		SELECT code, name, parent_code, level
@@ -7030,27 +7059,8 @@ func (s *Server) handleKpvedStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dbPath := r.URL.Query().Get("database")
-
-	// Определяем, какую БД использовать
-	var db *sql.DB
-
-	if dbPath != "" {
-		// Открываем временное соединение к указанной БД
-		conn, err := sql.Open("sqlite3", dbPath)
-		if err != nil {
-			log.Printf("Error opening database %s: %v", dbPath, err)
-			s.writeJSONError(w, fmt.Sprintf("Failed to open database: %v", err), http.StatusInternalServerError)
-			return
-		}
-		db = conn
-		defer conn.Close()
-	} else {
-		// Используем текущую БД
-		s.dbMutex.RLock()
-		db = s.db.GetDB()
-		s.dbMutex.RUnlock()
-	}
+	// Используем сервисную БД для классификатора КПВЭД
+	db := s.serviceDB.GetDB()
 
 	// Получаем общее количество записей в классификаторе
 	var totalCodes int
@@ -7132,32 +7142,9 @@ func (s *Server) handleKpvedLoad(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Определяем, какую БД использовать
-	var db *sql.DB
-	var dbPath string
-
-	if req.Database != "" {
-		// Открываем временное соединение к указанной БД
-		conn, err := sql.Open("sqlite3", req.Database)
-		if err != nil {
-			log.Printf("Error opening database %s: %v", req.Database, err)
-			s.writeJSONError(w, fmt.Sprintf("Failed to open database: %v", err), http.StatusInternalServerError)
-			return
-		}
-		db = conn
-		dbPath = req.Database
-		defer conn.Close()
-	} else {
-		// Используем текущую БД
-		s.dbMutex.RLock()
-		db = s.db.GetDB()
-		s.dbMutex.RUnlock()
-		dbPath = s.currentDBPath
-	}
-
-	// Загружаем КПВЭД из файла
-	log.Printf("Loading KPVED classifier from file: %s to database: %s", req.FilePath, dbPath)
-	if err := database.LoadKpvedFromFile(db, req.FilePath); err != nil {
+	// Используем сервисную БД для классификатора КПВЭД
+	log.Printf("Loading KPVED classifier from file: %s to service database", req.FilePath)
+	if err := database.LoadKpvedFromFile(s.serviceDB, req.FilePath); err != nil {
 		log.Printf("Error loading KPVED: %v", err)
 		s.writeJSONError(w, fmt.Sprintf("Failed to load KPVED: %v", err), http.StatusInternalServerError)
 		return
@@ -7165,7 +7152,7 @@ func (s *Server) handleKpvedLoad(w http.ResponseWriter, r *http.Request) {
 
 	// Получаем статистику после загрузки
 	var totalCodes int
-	err := db.QueryRow("SELECT COUNT(*) FROM kpved_classifier").Scan(&totalCodes)
+	err := s.serviceDB.QueryRow("SELECT COUNT(*) FROM kpved_classifier").Scan(&totalCodes)
 	if err != nil {
 		log.Printf("Error counting kpved codes: %v", err)
 		totalCodes = 0
@@ -7175,7 +7162,6 @@ func (s *Server) handleKpvedLoad(w http.ResponseWriter, r *http.Request) {
 		"success":     true,
 		"message":     "KPVED classifier loaded successfully",
 		"file_path":   req.FilePath,
-		"database":    dbPath,
 		"total_codes": totalCodes,
 	}
 
@@ -7258,7 +7244,7 @@ func (s *Server) handleKpvedReclassify(w http.ResponseWriter, r *http.Request) {
 	query := `
 		SELECT DISTINCT normalized_name, category
 		FROM normalized_data
-		WHERE (kpved_code IS NULL OR kpved_code = '')
+		WHERE (kpved_code IS NULL OR kpved_code = '' OR TRIM(kpved_code) = '')
 		LIMIT ?
 	`
 
@@ -7363,21 +7349,20 @@ func (s *Server) handleKpvedClassifyHierarchical(w http.ResponseWriter, r *http.
 		req.Category = "общее"
 	}
 
-	// Проверяем API ключ
-	apiKey := os.Getenv("ARLIAI_API_KEY")
-	if apiKey == "" {
-		http.Error(w, "AI API key not configured", http.StatusServiceUnavailable)
+	// Получаем API ключ и модель из WorkerConfigManager
+	apiKey, model, err := s.workerConfigManager.GetModelAndAPIKey()
+	if err != nil {
+		log.Printf("[KPVED Test] Error getting API key and model: %v", err)
+		http.Error(w, fmt.Sprintf("AI API key not configured: %v", err), http.StatusServiceUnavailable)
 		return
 	}
-
-	// Получаем модель из WorkerConfigManager
-	model := s.getModelFromConfig()
+	log.Printf("[KPVED Test] Using API key and model: %s", model)
 
 	// Создаем AI клиент
 	aiClient := nomenclature.NewAIClient(apiKey, model)
 
-	// Создаем иерархический классификатор (используем s.db где находится kpved_classifier)
-	hierarchicalClassifier, err := normalization.NewHierarchicalClassifier(s.db, aiClient)
+	// Создаем иерархический классификатор (используем serviceDB где находится kpved_classifier)
+	hierarchicalClassifier, err := normalization.NewHierarchicalClassifier(s.serviceDB, aiClient)
 	if err != nil {
 		log.Printf("Error creating hierarchical classifier: %v", err)
 		http.Error(w, fmt.Sprintf("Failed to create classifier: %v", err), http.StatusInternalServerError)
@@ -7402,6 +7387,22 @@ func (s *Server) handleKpvedClassifyHierarchical(w http.ResponseWriter, r *http.
 	s.writeJSONResponse(w, result, http.StatusOK)
 }
 
+// classificationTask представляет задачу для классификации группы
+type classificationTask struct {
+	normalizedName string
+	category       string
+	mergedCount    int // Количество дублей в группе
+	index          int
+}
+
+// classificationResult представляет результат классификации
+type classificationResult struct {
+	task         classificationTask
+	result       *normalization.HierarchicalResult
+	err          error
+	rowsAffected int64
+}
+
 // handleKpvedReclassifyHierarchical переклассифицирует существующие группы с иерархическим подходом
 func (s *Server) handleKpvedReclassifyHierarchical(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -7417,17 +7418,63 @@ func (s *Server) handleKpvedReclassifyHierarchical(w http.ResponseWriter, r *htt
 		req.Limit = 10 // По умолчанию 10 групп
 	}
 
-	apiKey := os.Getenv("ARLIAI_API_KEY")
-	if apiKey == "" {
-		http.Error(w, "AI API key not configured", http.StatusServiceUnavailable)
+	// Получаем API ключ и модель из WorkerConfigManager
+	apiKey, model, err := s.workerConfigManager.GetModelAndAPIKey()
+	if err != nil {
+		log.Printf("[KPVED] Error getting API key and model: %v", err)
+		http.Error(w, fmt.Sprintf("AI API key not configured: %v", err), http.StatusServiceUnavailable)
+		return
+	}
+	log.Printf("[KPVED] Using API key and model: %s", model)
+
+	// Валидация: проверяем наличие данных в normalized_data
+	// ВАЖНО: normalized_data находится в основной БД (s.db), а не в normalizedDB
+	var totalGroups int
+	err = s.db.QueryRow("SELECT COUNT(DISTINCT normalized_name || '|' || category) FROM normalized_data").Scan(&totalGroups)
+	if err != nil {
+		log.Printf("[KPVED] Error counting total groups: %v", err)
+	} else {
+		log.Printf("[KPVED] Total groups in normalized_data: %d", totalGroups)
+	}
+
+	// Валидация: проверяем наличие таблицы kpved_classifier в сервисной БД
+	var kpvedTableExists bool
+	err = s.serviceDB.QueryRow(`
+		SELECT EXISTS (
+			SELECT 1 FROM sqlite_master 
+			WHERE type='table' AND name='kpved_classifier'
+		)
+	`).Scan(&kpvedTableExists)
+	if err != nil {
+		log.Printf("[KPVED] Error checking kpved_classifier table: %v", err)
+	} else if !kpvedTableExists {
+		log.Printf("[KPVED] ERROR: Table kpved_classifier does not exist in service DB!")
+		http.Error(w, "KPVED classifier table not found", http.StatusInternalServerError)
 		return
 	}
 
-	// Получаем группы без КПВЭД классификации
+	// Валидация: проверяем количество записей в kpved_classifier
+	var kpvedNodesCount int
+	err = s.serviceDB.QueryRow("SELECT COUNT(*) FROM kpved_classifier").Scan(&kpvedNodesCount)
+	if err != nil {
+		log.Printf("[KPVED] Error counting kpved_classifier nodes: %v", err)
+	} else {
+		log.Printf("[KPVED] KPVED classifier nodes in database: %d", kpvedNodesCount)
+		if kpvedNodesCount == 0 {
+			log.Printf("[KPVED] ERROR: kpved_classifier table is empty!")
+			errorMsg := "Таблица kpved_classifier пуста. Загрузите классификатор КПВЭД через эндпоинт /api/kpved/load-from-file или используйте файл КПВЭД.txt"
+			http.Error(w, errorMsg, http.StatusInternalServerError)
+			return
+		}
+	}
+
+	// Получаем группы без КПВЭД классификации, отсортированные по количеству дублей (сначала группы с наибольшим количеством)
 	query := `
-		SELECT DISTINCT normalized_name, category
+		SELECT normalized_name, category, MAX(merged_count) as merged_count
 		FROM normalized_data
-		WHERE (kpved_code IS NULL OR kpved_code = '')
+		WHERE (kpved_code IS NULL OR kpved_code = '' OR TRIM(kpved_code) = '')
+		GROUP BY normalized_name, category
+		ORDER BY merged_count DESC
 		LIMIT ?
 	`
 
@@ -7436,80 +7483,544 @@ func (s *Server) handleKpvedReclassifyHierarchical(w http.ResponseWriter, r *htt
 		limitValue = 1000000 // Большое число для "все"
 	}
 
+	log.Printf("[KPVED] Querying groups without KPVED classification (limit: %d, sorted by merged_count DESC)...", limitValue)
+	// ВАЖНО: normalized_data находится в основной БД (s.db), а не в normalizedDB
 	rows, err := s.db.Query(query, limitValue)
 	if err != nil {
-		log.Printf("Error querying groups: %v", err)
+		log.Printf("[KPVED] Error querying groups: %v", err)
 		http.Error(w, "Failed to query groups", http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
 
-	// Получаем модель из WorkerConfigManager
-	model := s.getModelFromConfig()
-
 	// Создаем AI клиент и иерархический классификатор
-	aiClient := nomenclature.NewAIClient(apiKey, model)
-	hierarchicalClassifier, err := normalization.NewHierarchicalClassifier(s.normalizedDB, aiClient)
-	if err != nil {
-		log.Printf("Error creating hierarchical classifier: %v", err)
-		http.Error(w, fmt.Sprintf("Failed to create classifier: %v", err), http.StatusInternalServerError)
+	log.Printf("[KPVED] Creating hierarchical classifier with API key (length: %d) and model: %s", len(apiKey), model)
+	if apiKey == "" {
+		log.Printf("[KPVED] ERROR: API key is empty!")
+		http.Error(w, "API ключ не настроен. Настройте API ключ в конфигурации воркеров или переменной окружения ARLIAI_API_KEY", http.StatusServiceUnavailable)
 		return
 	}
 
+	log.Printf("[KPVED] Initializing AI client and hierarchical classifier...")
+	
+	// ВАЖНО: Проверяем, не работает ли нормализация одновременно
+	// Если работает, это может привести к превышению лимита параллельных запросов
+	s.normalizerMutex.RLock()
+	isNormalizerRunning := s.normalizerRunning
+	s.normalizerMutex.RUnlock()
+	
+	if isNormalizerRunning {
+		log.Printf("[KPVED] WARNING: Normalizer is running! This may cause exceeding Arliai API limit (2 parallel calls for ADVANCED plan)")
+		log.Printf("[KPVED] Consider stopping normalization before starting KPVED classification")
+	}
+	
+	// Создаем один AI клиент и один hierarchical classifier для всех воркеров
+	// ВАЖНО: Все воркеры будут использовать один и тот же aiClient экземпляр
+	// Это важно, так как rate limiter работает на уровне экземпляра AIClient
+	aiClient := nomenclature.NewAIClient(apiKey, model)
+	log.Printf("[KPVED] Created AI client instance (rate limiter: 1 req/sec, burst: 5)")
+	
+	hierarchicalClassifier, err := normalization.NewHierarchicalClassifier(s.serviceDB, aiClient)
+	if err != nil {
+		log.Printf("[KPVED] ERROR creating hierarchical classifier: %v", err)
+		errorMsg := fmt.Sprintf("Не удалось создать классификатор: %v. Проверьте, что таблица kpved_classifier загружена и содержит данные.", err)
+		http.Error(w, errorMsg, http.StatusInternalServerError)
+		return
+	}
+	log.Printf("[KPVED] Hierarchical classifier created successfully (will be shared by all workers)")
+
+	// Получаем статистику дерева КПВЭД
+	cacheStats := hierarchicalClassifier.GetCacheStats()
+	log.Printf("[KPVED] Hierarchical classifier created successfully. Cache stats: %+v", cacheStats)
+
+	// Сначала подсчитываем общее количество групп без КПВЭД (без учета лимита)
+	var totalGroupsWithoutKpved int
+	countQuery := `
+		SELECT COUNT(DISTINCT normalized_name || '|' || category)
+		FROM normalized_data
+		WHERE (kpved_code IS NULL OR kpved_code = '' OR TRIM(kpved_code) = '')
+	`
+	// ВАЖНО: normalized_data находится в основной БД (s.db), а не в normalizedDB
+	err = s.db.QueryRow(countQuery).Scan(&totalGroupsWithoutKpved)
+	if err != nil {
+		log.Printf("[KPVED] Error counting groups without KPVED: %v", err)
+		totalGroupsWithoutKpved = 0
+	} else {
+		log.Printf("[KPVED] Total groups without KPVED: %d (limit: %d)", totalGroupsWithoutKpved, limitValue)
+	}
+
+	// Проверяем на пустой результат
+	if totalGroupsWithoutKpved == 0 {
+		log.Printf("[KPVED] WARNING: No groups found without KPVED classification!")
+		// Проверяем, есть ли вообще группы с KPVED
+		var groupsWithKpved int
+		var totalGroups int
+		// ВАЖНО: normalized_data находится в основной БД (s.db), а не в normalizedDB
+		err = s.db.QueryRow(`
+			SELECT COUNT(DISTINCT normalized_name || '|' || category)
+			FROM normalized_data
+			WHERE kpved_code IS NOT NULL AND kpved_code != '' AND TRIM(kpved_code) != ''
+		`).Scan(&groupsWithKpved)
+		if err == nil {
+			log.Printf("[KPVED] Groups with KPVED: %d, Groups without KPVED: 0", groupsWithKpved)
+		}
+
+		// Получаем общее количество групп для информативности
+		err = s.db.QueryRow(`
+			SELECT COUNT(DISTINCT normalized_name || '|' || category)
+			FROM normalized_data
+		`).Scan(&totalGroups)
+		if err != nil {
+			totalGroups = 0
+		}
+
+		response := map[string]interface{}{
+			"classified":        0,
+			"failed":            0,
+			"total_duration":    0,
+			"avg_duration":      0,
+			"avg_steps":         0.0,
+			"avg_ai_calls":      0.0,
+			"total_ai_calls":    0,
+			"results":           []map[string]interface{}{},
+			"message":           fmt.Sprintf("Не найдено групп без классификации КПВЭД. Всего групп: %d, с классификацией: %d", totalGroups, groupsWithKpved),
+			"total_groups":      totalGroups,
+			"groups_with_kpved": groupsWithKpved,
+		}
+		s.writeJSONResponse(w, response, http.StatusOK)
+		return
+	}
+
+	// Функция для retry UPDATE запросов с экспоненциальной задержкой и таймаутом
+	retryUpdate := func(query string, args ...interface{}) (sql.Result, error) {
+		maxRetries := 5
+		baseDelay := 50 * time.Millisecond
+		queryTimeout := 10 * time.Second // Таймаут для каждого запроса
+
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			// Создаем context с таймаутом для запроса
+			ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+
+			// Выполняем запрос с таймаутом
+			result, err := s.db.ExecContext(ctx, query, args...)
+			cancel() // Освобождаем ресурсы context сразу после использования
+
+			if err == nil {
+				return result, nil
+			}
+
+			// Проверяем, является ли это ошибкой блокировки БД или таймаута
+			errStr := err.Error()
+			isLockError := strings.Contains(errStr, "database is locked") || strings.Contains(errStr, "locked")
+			isTimeoutError := strings.Contains(errStr, "timeout") || strings.Contains(errStr, "context deadline exceeded")
+
+			if !isLockError && !isTimeoutError {
+				// Если это не ошибка блокировки или таймаута, возвращаем сразу
+				return nil, err
+			}
+
+			if attempt < maxRetries-1 {
+				// Экспоненциальная задержка: 50ms, 100ms, 200ms, 400ms, 800ms
+				delay := baseDelay * time.Duration(1<<uint(attempt))
+				if isTimeoutError {
+					log.Printf("[KPVED] Query timeout, retrying in %v (attempt %d/%d)...", delay, attempt+1, maxRetries)
+				} else {
+					log.Printf("[KPVED] Database locked, retrying in %v (attempt %d/%d)...", delay, attempt+1, maxRetries)
+				}
+				time.Sleep(delay)
+			} else {
+				log.Printf("[KPVED] Max retries reached for database update")
+				return nil, err
+			}
+		}
+
+		return nil, fmt.Errorf("failed after %d retries", maxRetries)
+	}
+
+	// Собираем все задачи в слайс
+	var tasks []classificationTask
+	index := 0
+	for rows.Next() {
+		var normalizedName, category string
+		var mergedCount int
+		if err := rows.Scan(&normalizedName, &category, &mergedCount); err != nil {
+			log.Printf("[KPVED] Error scanning row: %v", err)
+			continue
+		}
+		tasks = append(tasks, classificationTask{
+			normalizedName: normalizedName,
+			category:       category,
+			mergedCount:    mergedCount,
+			index:          index,
+		})
+		index++
+	}
+
+	if err := rows.Err(); err != nil {
+		log.Printf("[KPVED] Error iterating rows: %v", err)
+		http.Error(w, "Failed to read groups from database", http.StatusInternalServerError)
+		return
+	}
+
+	if len(tasks) == 0 {
+		log.Printf("[KPVED] No tasks to process")
+		response := map[string]interface{}{
+			"classified":     0,
+			"failed":         0,
+			"total_duration": 0,
+			"avg_duration":   0,
+			"avg_steps":      0.0,
+			"avg_ai_calls":   0.0,
+			"total_ai_calls": 0,
+			"results":        []map[string]interface{}{},
+		}
+		s.writeJSONResponse(w, response, http.StatusOK)
+		return
+	}
+
+	// Определяем количество воркеров
+	// ВАЖНО: Arliai API ADVANCED план поддерживает только 2 параллельных вызова ВСЕГО
+	// Нужно проверить, не работают ли другие процессы (нормализация), которые также используют API
+	maxWorkers := 2 // Arliai API ограничение: максимум 2 параллельных вызова
+
+	// Проверяем, не работает ли нормализация одновременно
+	s.normalizerMutex.RLock()
+	isNormalizerRunning := s.normalizerRunning
+	s.normalizerMutex.RUnlock()
+	
+	if isNormalizerRunning {
+		log.Printf("[KPVED] WARNING: Normalizer is running simultaneously. Reducing workers to 1 to avoid exceeding Arliai API limit (2 parallel calls for ADVANCED plan)")
+		maxWorkers = 1 // Если нормализация работает, используем только 1 воркер
+	}
+
+	// Проверяем настройки из WorkerConfigManager
+	if s.workerConfigManager != nil {
+		provider, err := s.workerConfigManager.GetActiveProvider()
+		if err == nil && provider != nil {
+			if provider.MaxWorkers > 0 && provider.MaxWorkers < maxWorkers {
+				log.Printf("[KPVED] Using provider MaxWorkers=%d (requested %d)", provider.MaxWorkers, maxWorkers)
+				maxWorkers = provider.MaxWorkers
+			}
+		}
+		// Также проверяем глобальное значение
+		s.workerConfigManager.mu.RLock()
+		globalMaxWorkers := s.workerConfigManager.globalMaxWorkers
+		s.workerConfigManager.mu.RUnlock()
+		if globalMaxWorkers > 0 && globalMaxWorkers < maxWorkers {
+			log.Printf("[KPVED] Using global MaxWorkers=%d (requested %d)", globalMaxWorkers, maxWorkers)
+			maxWorkers = globalMaxWorkers
+		}
+	}
+
+	// ВАЖНО: Arliai API ADVANCED план поддерживает только 2 параллельных вызова ВСЕГО
+	// Не превышаем лимит, но используем максимум доступных воркеров
+	if maxWorkers > 2 {
+		log.Printf("[KPVED] WARNING: Requested %d workers, but Arliai API ADVANCED plan supports only 2 parallel calls TOTAL. Limiting to 2 workers.", maxWorkers)
+		maxWorkers = 2
+	}
+	// Обеспечиваем минимум 1 воркер
+	if maxWorkers < 1 {
+		maxWorkers = 1
+	}
+	
+	log.Printf("[KPVED] Using %d workers for classification (normalizer running: %v, Arliai API limit: 2 parallel calls)", maxWorkers, isNormalizerRunning)
+	log.Printf("[KPVED] IMPORTANT: All %d workers will share the same AI client instance to respect rate limits", maxWorkers)
+	
+	if isNormalizerRunning && maxWorkers >= 2 {
+		log.Printf("[KPVED] CRITICAL: Normalizer is running AND using %d workers! This will likely exceed Arliai API limit (2 parallel calls)", maxWorkers)
+		log.Printf("[KPVED] Total parallel requests: %d (normalizer) + %d (KPVED workers) = %d (limit: 2)", 1, maxWorkers, maxWorkers+1)
+	}
+
+	log.Printf("[KPVED] Starting classification with %d workers for %d groups (sorted by merged_count DESC)", maxWorkers, len(tasks))
+
+	// Создаем каналы для задач и результатов
+	// Ограничиваем буфер канала, чтобы не загружать все задачи сразу
+	// Это предотвращает одновременную отправку большого количества запросов
+	taskChan := make(chan classificationTask, maxWorkers*2) // Буфер только для 2 задач
+	resultChan := make(chan classificationResult, maxWorkers*2)
+	var wg sync.WaitGroup
+
+	// Очищаем map для отслеживания текущих задач перед началом новой классификации
+	s.kpvedCurrentTasksMutex.Lock()
+	s.kpvedCurrentTasks = make(map[int]*classificationTask)
+	s.kpvedCurrentTasksMutex.Unlock()
+
+	// Сбрасываем флаг остановки при начале новой классификации
+	s.kpvedWorkersStopMutex.Lock()
+	s.kpvedWorkersStopped = false
+	s.kpvedWorkersStopMutex.Unlock()
+
+	for i := 0; i < maxWorkers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for task := range taskChan {
+				// Проверяем флаг остановки перед обработкой задачи
+				s.kpvedWorkersStopMutex.RLock()
+				stopped := s.kpvedWorkersStopped
+				s.kpvedWorkersStopMutex.RUnlock()
+
+				if stopped {
+					log.Printf("[KPVED Worker %d] Stopped by user, skipping task %d: '%s'", workerID, task.index, task.normalizedName)
+					// Удаляем задачу из отслеживания
+					s.kpvedCurrentTasksMutex.Lock()
+					delete(s.kpvedCurrentTasks, workerID)
+					s.kpvedCurrentTasksMutex.Unlock()
+					// Отправляем результат с ошибкой остановки
+					resultChan <- classificationResult{
+						task: task,
+						err:  fmt.Errorf("worker stopped by user"),
+					}
+					continue
+				}
+
+				// Обновляем текущую задачу для этого воркера
+				s.kpvedCurrentTasksMutex.Lock()
+				s.kpvedCurrentTasks[workerID] = &task
+				s.kpvedCurrentTasksMutex.Unlock()
+
+				// Логируем каждую задачу для отслеживания параллелизма (только каждую 100-ю для уменьшения логов)
+				if task.index%100 == 0 {
+					log.Printf("[KPVED Worker %d] Processing task %d: '%s' in category '%s' (merged_count: %d)",
+						workerID, task.index, task.normalizedName, task.category, task.mergedCount)
+				}
+
+				// Классифицируем с иерархическим подходом
+				// Логируем только каждую 10-ю задачу для уменьшения объема логов
+				if task.index%10 == 0 {
+					log.Printf("[KPVED Worker %d] Starting classification for '%s' (category: '%s')", workerID, task.normalizedName, task.category)
+				}
+
+				result, err := hierarchicalClassifier.Classify(task.normalizedName, task.category)
+
+				if err != nil {
+					// Проверяем тип ошибки
+					errStr := err.Error()
+					isRateLimit := strings.Contains(errStr, "rate limit") ||
+						strings.Contains(errStr, "too many requests") ||
+						strings.Contains(errStr, "429") ||
+						strings.Contains(errStr, "quota exceeded") ||
+						strings.Contains(errStr, "exceeded the maximum number of parallel requests")
+
+					isCircuitBreakerOpen := strings.Contains(errStr, "circuit breaker is open")
+
+					// Если circuit breaker открыт, ждем пока он закроется
+					if isCircuitBreakerOpen {
+						log.Printf("[KPVED Worker %d] Circuit breaker is open, waiting for recovery (task: '%s')...", workerID, task.normalizedName)
+						// Ждем 5 секунд перед повторной попыткой
+						time.Sleep(5 * time.Second)
+						// Пытаемся еще раз
+						retryResult, retryErr := hierarchicalClassifier.Classify(task.normalizedName, task.category)
+						if retryErr == nil {
+							// Успешно после retry - используем результат
+							result = retryResult
+							err = nil
+						} else {
+							errStr = retryErr.Error()
+							isCircuitBreakerOpen = strings.Contains(errStr, "circuit breaker is open")
+							if isCircuitBreakerOpen {
+								log.Printf("[KPVED Worker %d] Circuit breaker still open after retry, waiting 10 more seconds...", workerID)
+								time.Sleep(10 * time.Second)
+								// Последняя попытка
+								finalResult, finalErr := hierarchicalClassifier.Classify(task.normalizedName, task.category)
+								if finalErr == nil {
+									// Успешно после последней попытки
+									result = finalResult
+									err = nil
+								} else {
+									// Все попытки неудачны
+									err = finalErr
+								}
+							} else {
+								// Другая ошибка после retry
+								err = retryErr
+							}
+						}
+					}
+					
+					// Если после всех retry все еще есть ошибка, обрабатываем ее
+					if err != nil {
+						// Обновляем errStr после возможных retry
+						errStr = err.Error()
+						isRateLimit = strings.Contains(errStr, "rate limit") ||
+							strings.Contains(errStr, "too many requests") ||
+							strings.Contains(errStr, "429") ||
+							strings.Contains(errStr, "quota exceeded") ||
+							strings.Contains(errStr, "exceeded the maximum number of parallel requests")
+
+						// Если это rate limit или превышение параллельных запросов, делаем паузу
+						if isRateLimit {
+							log.Printf("[KPVED Worker %d] Rate limit detected, pausing for 3 seconds before retry...", workerID)
+							time.Sleep(3 * time.Second)
+						}
+						
+						// Добавляем небольшую задержку между запросами для предотвращения перегрузки API
+						// Это особенно важно при использовании 1 воркера
+						time.Sleep(100 * time.Millisecond)
+
+						// Удаляем задачу из отслеживания при ошибке
+						s.kpvedCurrentTasksMutex.Lock()
+						delete(s.kpvedCurrentTasks, workerID)
+						s.kpvedCurrentTasksMutex.Unlock()
+
+						// Детальное логирование ошибки
+						log.Printf("[KPVED Worker %d] ERROR classifying '%s' (category: '%s', merged_count: %d): %v",
+							workerID, task.normalizedName, task.category, task.mergedCount, err)
+						// Пытаемся извлечь более детальную информацию об ошибке
+						if isRateLimit {
+							log.Printf("[KPVED Worker %d]   -> Rate limit error - Arliai API limit reached, paused and will retry", workerID)
+						} else if strings.Contains(errStr, "ai call failed") {
+							log.Printf("[KPVED Worker %d]   -> AI call failed - check API key, network connection, or rate limits", workerID)
+						} else if strings.Contains(errStr, "no candidates found") {
+							log.Printf("[KPVED Worker %d]   -> No candidates found in KPVED tree - check classifier data", workerID)
+						} else if strings.Contains(errStr, "json unmarshal") {
+							log.Printf("[KPVED Worker %d]   -> JSON parsing error - AI response format issue", workerID)
+						} else if strings.Contains(errStr, "timeout") {
+							log.Printf("[KPVED Worker %d]   -> Timeout error - AI service may be slow", workerID)
+						}
+
+						resultChan <- classificationResult{
+							task: task,
+							err:  err,
+						}
+						continue
+					}
+
+				// Обновляем все записи в этой группе с retry логикой
+				// ВАЖНО: normalized_data находится в основной БД (s.db), а не в normalizedDB
+				updateQuery := `
+					UPDATE normalized_data
+					SET kpved_code = ?, kpved_name = ?, kpved_confidence = ?
+					WHERE normalized_name = ? AND category = ?
+				`
+				updateResult, err := retryUpdate(updateQuery, result.FinalCode, result.FinalName, result.FinalConfidence, task.normalizedName, task.category)
+				if err != nil {
+					// Удаляем задачу из отслеживания при ошибке обновления
+					s.kpvedCurrentTasksMutex.Lock()
+					delete(s.kpvedCurrentTasks, workerID)
+					s.kpvedCurrentTasksMutex.Unlock()
+
+					log.Printf("[KPVED Worker %d] Failed to update group '%s' (category: '%s') after retries: %v", workerID, task.normalizedName, task.category, err)
+					resultChan <- classificationResult{
+						task: task,
+						err:  err,
+					}
+					continue
+				}
+
+				rowsAffected, _ := updateResult.RowsAffected()
+				if rowsAffected == 0 {
+					log.Printf("[KPVED Worker %d] WARNING: Update query affected 0 rows for group '%s' (category: '%s')", workerID, task.normalizedName, task.category)
+				} else {
+					log.Printf("[KPVED Worker %d] Updated %d rows for group '%s' (category: '%s') -> KPVED: %s (%s, confidence: %.2f)",
+						workerID, rowsAffected, task.normalizedName, task.category, result.FinalCode, result.FinalName, result.FinalConfidence)
+				}
+
+				// Удаляем задачу из отслеживания после успешного завершения
+				s.kpvedCurrentTasksMutex.Lock()
+				delete(s.kpvedCurrentTasks, workerID)
+				s.kpvedCurrentTasksMutex.Unlock()
+
+				resultChan <- classificationResult{
+					task:         task,
+					result:       result,
+					rowsAffected: rowsAffected,
+				}
+				
+				// Добавляем задержку после успешной классификации для предотвращения перегрузки API
+				// Это особенно важно при использовании 1 воркера, чтобы не превысить rate limits
+				time.Sleep(200 * time.Millisecond)
+			}
+		}(i)
+	}
+
+	// Отправляем задачи в канал в отдельной горутине
+	// Ограничиваем скорость загрузки задач, чтобы не перегрузить канал и не вызвать circuit breaker
+	go func() {
+		for i, task := range tasks {
+			taskChan <- task
+			// Добавляем небольшую задержку каждые 10 задач, чтобы не перегружать канал
+			// Это предотвращает одновременную отправку большого количества запросов
+			if i > 0 && i%10 == 0 {
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
+		close(taskChan)
+	}()
+
+	// Закрываем канал результатов после завершения всех воркеров
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// Собираем результаты в главной горутине
 	classified := 0
 	failed := 0
 	totalDuration := int64(0)
 	totalSteps := 0
 	totalAICalls := 0
 	results := []map[string]interface{}{}
+	errorSamples := []string{} // Сохраняем первые 10 ошибок для диагностики
 
-	for rows.Next() {
-		var normalizedName, category string
-		if err := rows.Scan(&normalizedName, &category); err != nil {
-			continue
-		}
-
-		// Классифицируем с иерархическим подходом
-		result, err := hierarchicalClassifier.Classify(normalizedName, category)
-		if err != nil {
-			log.Printf("Failed to classify '%s': %v", normalizedName, err)
+	for res := range resultChan {
+		if res.err != nil {
 			failed++
-			continue
-		}
+			errorMsg := res.err.Error()
 
-		// Обновляем все записи в этой группе
-		updateQuery := `
-			UPDATE normalized_data
-			SET kpved_code = ?, kpved_name = ?, kpved_confidence = ?
-			WHERE normalized_name = ? AND category = ?
-		`
-		_, err = s.db.Exec(updateQuery, result.FinalCode, result.FinalName, result.FinalConfidence, normalizedName, category)
-		if err != nil {
-			log.Printf("Failed to update group '%s': %v", normalizedName, err)
-			failed++
-			continue
-		}
+			// Сохраняем первые 10 ошибок для диагностики
+			if len(errorSamples) < 10 {
+				errorSamples = append(errorSamples, fmt.Sprintf("'%s' (category: '%s'): %s",
+					res.task.normalizedName, res.task.category, errorMsg))
+			}
 
-		classified++
-		totalDuration += result.TotalDuration
-		totalSteps += len(result.Steps)
-		totalAICalls += result.AICallsCount
+			// Логируем первые 10 ошибок для диагностики с детальной информацией
+			if failed <= 10 {
+				log.Printf("[KPVED] Error sample %d: '%s' (category: '%s', merged_count: %d) -> %v",
+					failed, res.task.normalizedName, res.task.category, res.task.mergedCount, res.err)
+				// Анализируем тип ошибки
+				errStr := errorMsg
+				if strings.Contains(errStr, "ai call failed") {
+					log.Printf("[KPVED]   -> AI call failed - check API key, network, or rate limits")
+				} else if strings.Contains(errStr, "no candidates found") {
+					log.Printf("[KPVED]   -> No candidates in KPVED tree - check classifier data")
+				} else if strings.Contains(errStr, "json unmarshal") {
+					log.Printf("[KPVED]   -> JSON parsing error - AI response format issue")
+				} else if strings.Contains(errStr, "timeout") {
+					log.Printf("[KPVED]   -> Timeout error - AI service may be slow or unavailable")
+				}
+			}
 
-		results = append(results, map[string]interface{}{
-			"normalized_name":  normalizedName,
-			"category":         category,
-			"kpved_code":       result.FinalCode,
-			"kpved_name":       result.FinalName,
-			"kpved_confidence": result.FinalConfidence,
-			"steps":            len(result.Steps),
-			"duration_ms":      result.TotalDuration,
-			"ai_calls":         result.AICallsCount,
-		})
+			// Добавляем детальную информацию об ошибке в результаты
+			results = append(results, map[string]interface{}{
+				"normalized_name": res.task.normalizedName,
+				"category":        res.task.category,
+				"error":           errorMsg,
+				"success":         false,
+			})
+		} else {
+			classified++
+			totalDuration += res.result.TotalDuration
+			totalSteps += len(res.result.Steps)
+			totalAICalls += res.result.AICallsCount
 
-		// Логируем прогресс
-		if classified%10 == 0 {
-			avgDuration := totalDuration / int64(classified)
-			log.Printf("Reclassified %d groups (avg: %dms, %d AI calls)...", classified, avgDuration, totalAICalls)
+			results = append(results, map[string]interface{}{
+				"normalized_name":  res.task.normalizedName,
+				"category":         res.task.category,
+				"kpved_code":       res.result.FinalCode,
+				"kpved_name":       res.result.FinalName,
+				"kpved_confidence": res.result.FinalConfidence,
+				"steps":            len(res.result.Steps),
+				"duration_ms":      res.result.TotalDuration,
+				"ai_calls":         res.result.AICallsCount,
+			})
+
+			// Промежуточное обновление статуса каждые 20 групп для отображения прогресса на фронтенде
+			if classified%20 == 0 {
+				avgDuration := totalDuration / int64(classified)
+				log.Printf("[KPVED] Progress: %d/%d classified (avg: %dms, %d AI calls, %d failed)...",
+					classified+failed, len(tasks), avgDuration, totalAICalls, failed)
+			}
 		}
 	}
 
@@ -7522,6 +8033,18 @@ func (s *Server) handleKpvedReclassifyHierarchical(w http.ResponseWriter, r *htt
 		avgAICalls = float64(totalAICalls) / float64(classified)
 	}
 
+	// Формируем сообщение о результате
+	var message string
+	if classified > 0 && failed == 0 {
+		message = fmt.Sprintf("Классификация завершена успешно! Обработано %d групп.", classified)
+	} else if classified > 0 && failed > 0 {
+		message = fmt.Sprintf("Классификация завершена частично. Обработано: %d, ошибок: %d", classified, failed)
+	} else if classified == 0 && failed > 0 {
+		message = fmt.Sprintf("Все группы (%d) завершились с ошибкой. Проверьте логи и настройки API.", failed)
+	} else {
+		message = "Классификация завершена, но не найдено групп для обработки."
+	}
+
 	response := map[string]interface{}{
 		"classified":     classified,
 		"failed":         failed,
@@ -7531,10 +8054,74 @@ func (s *Server) handleKpvedReclassifyHierarchical(w http.ResponseWriter, r *htt
 		"avg_ai_calls":   avgAICalls,
 		"total_ai_calls": totalAICalls,
 		"results":        results,
+		"message":        message,
+		"total_groups":   len(tasks),
 	}
 
-	log.Printf("Hierarchical reclassification completed: %d classified, %d failed, avg %dms/item",
-		classified, failed, avgDuration)
+	log.Printf("[KPVED] Hierarchical reclassification completed: %d classified, %d failed out of %d total, avg %dms/item",
+		classified, failed, len(tasks), avgDuration)
+
+	// Очищаем отслеживание задач после завершения всей классификации
+	s.kpvedCurrentTasksMutex.Lock()
+	s.kpvedCurrentTasks = make(map[int]*classificationTask)
+	s.kpvedCurrentTasksMutex.Unlock()
+
+	// Сбрасываем флаг остановки после завершения классификации
+	s.kpvedWorkersStopMutex.Lock()
+	s.kpvedWorkersStopped = false
+	s.kpvedWorkersStopMutex.Unlock()
+
+	if failed > 0 && classified == 0 {
+		log.Printf("[KPVED] ERROR: All %d groups failed classification! Check logs above for details.", failed)
+		if len(errorSamples) > 0 {
+			log.Printf("[KPVED] First %d error samples:", len(errorSamples))
+			for i, sample := range errorSamples {
+				log.Printf("[KPVED]   %d. %s", i+1, sample)
+			}
+			// Обновляем сообщение с примерами ошибок
+			sampleCount := min(len(errorSamples), 3)
+			if sampleCount > 0 {
+				message = fmt.Sprintf("Все группы (%d) завершились с ошибкой. Примеры ошибок:\n%s\n\nПроверьте логи сервера для деталей. Возможные причины: неверный API ключ, отсутствие данных КПВЭД классификатора, проблемы с сетью.",
+					failed, strings.Join(errorSamples[:sampleCount], "\n"))
+				// Добавляем примеры ошибок в ответ
+				response["error_samples"] = errorSamples[:sampleCount]
+			}
+			// Обновляем message в response
+			response["message"] = message
+		}
+	}
+
+	s.writeJSONResponse(w, response, http.StatusOK)
+}
+
+// handleKpvedCurrentTasks возвращает текущие обрабатываемые задачи
+func (s *Server) handleKpvedCurrentTasks(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	s.kpvedCurrentTasksMutex.RLock()
+	defer s.kpvedCurrentTasksMutex.RUnlock()
+
+	// Преобразуем map в массив для JSON
+	currentTasks := []map[string]interface{}{}
+	for workerID, task := range s.kpvedCurrentTasks {
+		if task != nil {
+			currentTasks = append(currentTasks, map[string]interface{}{
+				"worker_id":       workerID,
+				"normalized_name": task.normalizedName,
+				"category":        task.category,
+				"merged_count":    task.mergedCount,
+				"index":           task.index,
+			})
+		}
+	}
+
+	response := map[string]interface{}{
+		"current_tasks": currentTasks,
+		"count":         len(currentTasks),
+	}
 
 	s.writeJSONResponse(w, response, http.StatusOK)
 }
