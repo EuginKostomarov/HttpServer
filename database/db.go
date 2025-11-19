@@ -1,6 +1,7 @@
 package database
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -129,6 +130,16 @@ func (db *DB) Close() error {
 // GetDB возвращает указатель на sql.DB для прямого доступа
 func (db *DB) GetDB() *sql.DB {
 	return db.conn
+}
+
+// GetConnection возвращает указатель на sql.DB (алиас для GetDB)
+func (db *DB) GetConnection() *sql.DB {
+	return db.conn
+}
+
+// ExecContext выполняет запрос с контекстом
+func (db *DB) ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
+	return db.conn.ExecContext(ctx, query, args...)
 }
 
 // CreateUpload создает новую выгрузку

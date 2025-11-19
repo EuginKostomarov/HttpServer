@@ -92,6 +92,33 @@ curl http://localhost:9999/api/uploads/{uuid}
 curl "http://localhost:9999/api/uploads/{uuid}/data?type=constants"
 ```
 
+## Конфигурация окружения
+
+### Frontend (.env файлы)
+
+Frontend использует переменные окружения для настройки подключения к backend серверу.
+
+**Для разработки** создайте файл `frontend/.env.local`:
+
+```env
+BACKEND_URL=http://localhost:9999
+SERVICE_DB_NAME=Сервисная БД
+```
+
+**Для production** создайте файл `frontend/.env.production`:
+
+```env
+BACKEND_URL=https://your-production-backend.example.com
+SERVICE_DB_NAME=Production Database
+```
+
+**Доступные переменные:**
+
+- `BACKEND_URL` - URL Go backend сервера (по умолчанию: `http://localhost:9999`)
+- `SERVICE_DB_NAME` - Отображаемое имя сервисной базы данных
+
+**Примечание:** Файл `.env.local` используется для локальной разработки и не должен коммититься в git. Используйте `.env.example` как шаблон.
+
 ## Структура проекта
 
 ```

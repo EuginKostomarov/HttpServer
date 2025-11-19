@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { violationResolveSchema, validateRequest, formatValidationError } from '@/lib/validation'
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || process.env.BACKEND_URL || 'http://localhost:9999'
+const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:9999'
 
 export async function POST(
   request: NextRequest,
@@ -17,6 +18,18 @@ export async function POST(
     }
 
     const body = await request.json().catch(() => ({}))
+
+    // Validate request body
+    const validation = validateRequest(violationResolveSchema, body)
+    if (!validation.success) {
+      return NextResponse.json(
+        {
+          error: 'Validation failed',
+          details: formatValidationError(validation.details)
+        },
+        { status: 400 }
+      )
+    }
     
     const backendUrl = `${BACKEND_URL}/api/quality/violations/${violationId}`
     
@@ -27,7 +40,7 @@ export async function POST(
       headers: {
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify(validation.data),
     })
 
     if (!response.ok) {

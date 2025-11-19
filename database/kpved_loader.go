@@ -10,6 +10,11 @@ import (
 	"strings"
 )
 
+// DBConnection интерфейс для доступа к базе данных
+type DBConnection interface {
+	GetDB() *sql.DB
+}
+
 // KpvedEntry представляет одну запись классификатора КПВЭД
 type KpvedEntry struct {
 	Code       string
@@ -184,9 +189,9 @@ func determineParentCode(code string) string {
 }
 
 // LoadKpvedToDatabase загружает записи КПВЭД в базу данных
-func LoadKpvedToDatabase(db *sql.DB, entries []KpvedEntry) error {
+func LoadKpvedToDatabase(db DBConnection, entries []KpvedEntry) error {
 	// Начинаем транзакцию для batch insert
-	tx, err := db.Begin()
+	tx, err := db.GetDB().Begin()
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -231,7 +236,7 @@ func LoadKpvedToDatabase(db *sql.DB, entries []KpvedEntry) error {
 }
 
 // LoadKpvedFromFile - вспомогательная функция для загрузки КПВЭД из файла в БД
-func LoadKpvedFromFile(db *sql.DB, filePath string) error {
+func LoadKpvedFromFile(db DBConnection, filePath string) error {
 	log.Printf("Loading KPVED classifier from file: %s", filePath)
 
 	// Парсим файл

@@ -6,9 +6,13 @@ import (
 	"log"
 	"sort"
 	"strings"
-
-	"httpserver/database"
 )
+
+// KpvedDB интерфейс для доступа к базе данных КПВЭД
+type KpvedDB interface {
+	Query(query string, args ...interface{}) (*sql.Rows, error)
+	QueryRow(query string, args ...interface{}) *sql.Row
+}
 
 // KpvedLevel уровень иерархии КПВЭД
 type KpvedLevel string
@@ -50,7 +54,7 @@ func NewKpvedTree() *KpvedTree {
 }
 
 // BuildFromDatabase строит дерево из базы данных
-func (t *KpvedTree) BuildFromDatabase(db *database.DB) error {
+func (t *KpvedTree) BuildFromDatabase(db KpvedDB) error {
 	query := `SELECT code, name, parent_code, level FROM kpved_classifier ORDER BY code`
 
 	rows, err := db.Query(query)

@@ -68,8 +68,15 @@ func main() {
 		log.Fatalf("Ошибка парсинга дерева классификатора: %v", err)
 	}
 
+	// Подключаемся к service.db для конфигурации
+	serviceDB, err := database.NewServiceDB("service.db")
+	if err != nil {
+		log.Fatalf("Ошибка подключения к service.db: %v", err)
+	}
+	defer serviceDB.Close()
+
 	// Создаем менеджер конфигурации для получения модели
-	configManager := server.NewWorkerConfigManager()
+	configManager := server.NewWorkerConfigManager(serviceDB)
 	
 	// Получаем API ключ и модель из конфигурации
 	apiKey, model, err := configManager.GetModelAndAPIKey()

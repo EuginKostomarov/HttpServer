@@ -112,8 +112,8 @@ func NewServerWithConfig(db *database.DB, normalizedDB *database.DB, serviceDB *
 	// чтобы передать его в normalizer для получения API ключа из БД
 	workerConfigManager := NewWorkerConfigManager(serviceDB)
 
-	// Создаем нормализатор с передачей workerConfigManager
-	normalizer := normalization.NewNormalizer(db, normalizerEvents, aiConfig, workerConfigManager)
+	// Создаем нормализатор
+	normalizer := normalization.NewNormalizer(db, normalizerEvents, aiConfig)
 
 	// Создаем анализатор качества
 	qualityAnalyzer := quality.NewQualityAnalyzer(db)
@@ -268,6 +268,11 @@ func (s *Server) setupMux() http.Handler {
 	mux.HandleFunc("/api/normalization/group-items", s.handleNormalizationGroupItems)
 	mux.HandleFunc("/api/normalization/item-attributes/", s.handleNormalizationItemAttributes)
 	mux.HandleFunc("/api/normalization/export-group", s.handleNormalizationExportGroup)
+
+	// Pipeline statistics endpoints
+	mux.HandleFunc("/api/normalization/pipeline/stats", s.handlePipelineStats)
+	mux.HandleFunc("/api/normalization/pipeline/stage-details", s.handleStageDetails)
+	mux.HandleFunc("/api/normalization/export", s.handleExport)
 
 	// Регистрируем эндпоинты для конфигурации нормализации
 	mux.HandleFunc("/api/normalization/config", s.handleNormalizationConfig)
@@ -3028,15 +3033,15 @@ func (s *Server) handleNormalizeStart(w http.ResponseWriter, r *http.Request) {
 			RateLimitDelay: 100 * time.Millisecond,
 			MaxRetries:     3,
 		}
-		// Передаем workerConfigManager для получения API ключа из БД
-		normalizerToUse = normalization.NewNormalizer(tempDB, s.normalizerEvents, aiConfig, s.workerConfigManager)
+		// Создаем временный normalizer для БД
+		normalizerToUse = normalization.NewNormalizer(tempDB, s.normalizerEvents, aiConfig)
 		normalizerToUse.SetSourceConfig(
 			config.SourceTable,
 			config.ReferenceColumn,
 			config.CodeColumn,
 			config.NameColumn,
 		)
-		log.Printf("Создан временный normalizer для БД: %s (с WorkerConfigManager)", req.Database)
+		log.Printf("Создан временный normalizer для БД: %s", req.Database)
 	} else {
 		// Используем стандартный normalizer
 		normalizerToUse = s.normalizer
@@ -7502,24 +7507,24 @@ func (s *Server) handleKpvedReclassifyHierarchical(w http.ResponseWriter, r *htt
 	}
 
 	log.Printf("[KPVED] Initializing AI client and hierarchical classifier...")
-	
+
 	// ВАЖНО: Проверяем, не работает ли нормализация одновременно
 	// Если работает, это может привести к превышению лимита параллельных запросов
 	s.normalizerMutex.RLock()
 	isNormalizerRunning := s.normalizerRunning
 	s.normalizerMutex.RUnlock()
-	
+
 	if isNormalizerRunning {
 		log.Printf("[KPVED] WARNING: Normalizer is running! This may cause exceeding Arliai API limit (2 parallel calls for ADVANCED plan)")
 		log.Printf("[KPVED] Consider stopping normalization before starting KPVED classification")
 	}
-	
+
 	// Создаем один AI клиент и один hierarchical classifier для всех воркеров
 	// ВАЖНО: Все воркеры будут использовать один и тот же aiClient экземпляр
 	// Это важно, так как rate limiter работает на уровне экземпляра AIClient
 	aiClient := nomenclature.NewAIClient(apiKey, model)
 	log.Printf("[KPVED] Created AI client instance (rate limiter: 1 req/sec, burst: 5)")
-	
+
 	hierarchicalClassifier, err := normalization.NewHierarchicalClassifier(s.serviceDB, aiClient)
 	if err != nil {
 		log.Printf("[KPVED] ERROR creating hierarchical classifier: %v", err)
@@ -7685,9 +7690,9 @@ func (s *Server) handleKpvedReclassifyHierarchical(w http.ResponseWriter, r *htt
 
 	// Проверяем, не работает ли нормализация одновременно
 	s.normalizerMutex.RLock()
-	isNormalizerRunning := s.normalizerRunning
+	isNormalizerRunning = s.normalizerRunning
 	s.normalizerMutex.RUnlock()
-	
+
 	if isNormalizerRunning {
 		log.Printf("[KPVED] WARNING: Normalizer is running simultaneously. Reducing workers to 1 to avoid exceeding Arliai API limit (2 parallel calls for ADVANCED plan)")
 		maxWorkers = 1 // Если нормализация работает, используем только 1 воркер
@@ -7722,10 +7727,10 @@ func (s *Server) handleKpvedReclassifyHierarchical(w http.ResponseWriter, r *htt
 	if maxWorkers < 1 {
 		maxWorkers = 1
 	}
-	
+
 	log.Printf("[KPVED] Using %d workers for classification (normalizer running: %v, Arliai API limit: 2 parallel calls)", maxWorkers, isNormalizerRunning)
 	log.Printf("[KPVED] IMPORTANT: All %d workers will share the same AI client instance to respect rate limits", maxWorkers)
-	
+
 	if isNormalizerRunning && maxWorkers >= 2 {
 		log.Printf("[KPVED] CRITICAL: Normalizer is running AND using %d workers! This will likely exceed Arliai API limit (2 parallel calls)", maxWorkers)
 		log.Printf("[KPVED] Total parallel requests: %d (normalizer) + %d (KPVED workers) = %d (limit: 2)", 1, maxWorkers, maxWorkers+1)
@@ -7837,7 +7842,7 @@ func (s *Server) handleKpvedReclassifyHierarchical(w http.ResponseWriter, r *htt
 							}
 						}
 					}
-					
+
 					// Если после всех retry все еще есть ошибка, обрабатываем ее
 					if err != nil {
 						// Обновляем errStr после возможных retry
@@ -7853,7 +7858,7 @@ func (s *Server) handleKpvedReclassifyHierarchical(w http.ResponseWriter, r *htt
 							log.Printf("[KPVED Worker %d] Rate limit detected, pausing for 3 seconds before retry...", workerID)
 							time.Sleep(3 * time.Second)
 						}
-						
+
 						// Добавляем небольшую задержку между запросами для предотвращения перегрузки API
 						// Это особенно важно при использовании 1 воркера
 						time.Sleep(100 * time.Millisecond)
@@ -7885,6 +7890,7 @@ func (s *Server) handleKpvedReclassifyHierarchical(w http.ResponseWriter, r *htt
 						}
 						continue
 					}
+				}
 
 				// Обновляем все записи в этой группе с retry логикой
 				// ВАЖНО: normalized_data находится в основной БД (s.db), а не в normalizedDB
@@ -7926,7 +7932,7 @@ func (s *Server) handleKpvedReclassifyHierarchical(w http.ResponseWriter, r *htt
 					result:       result,
 					rowsAffected: rowsAffected,
 				}
-				
+
 				// Добавляем задержку после успешной классификации для предотвращения перегрузки API
 				// Это особенно важно при использовании 1 воркера, чтобы не превысить rate limits
 				time.Sleep(200 * time.Millisecond)

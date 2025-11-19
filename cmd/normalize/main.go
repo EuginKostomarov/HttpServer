@@ -93,8 +93,15 @@ func main() {
 
 	// Если AI не включен, но есть КПВЭД классификатор, инициализируем его вручную
 	if !*useAI && kpvedCount > 0 {
+		// Подключаемся к service.db для конфигурации
+		serviceDB, err := database.NewServiceDB("service.db")
+		if err != nil {
+			log.Fatalf("Ошибка подключения к service.db: %v", err)
+		}
+		defer serviceDB.Close()
+
 		// Создаем менеджер конфигурации для получения модели и API ключа
-		configManager := server.NewWorkerConfigManager()
+		configManager := server.NewWorkerConfigManager(serviceDB)
 		
 		// Получаем API ключ и модель из конфигурации
 		apiKey, model, err := configManager.GetModelAndAPIKey()

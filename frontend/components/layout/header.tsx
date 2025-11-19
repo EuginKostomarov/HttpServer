@@ -23,6 +23,7 @@ export function Header() {
     { name: 'Главная', href: '/' },
     { name: 'Клиенты', href: '/clients' },
     { name: 'Процессы', href: '/processes' },
+    { name: 'Этапы обработки', href: '/pipeline-stages' },
     { name: 'Качество', href: '/quality' },
     { name: 'Мониторинг', href: '/monitoring' },
     { name: 'Результаты', href: '/results' },

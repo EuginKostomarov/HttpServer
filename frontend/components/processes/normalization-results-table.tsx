@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback, useRef, memo } from 'react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   Table,
@@ -63,6 +63,188 @@ interface NormalizationResultsTableProps {
   isRunning: boolean
   database?: string
 }
+
+// ============================================================================
+// Memoized Components for Performance Optimization
+// ============================================================================
+
+/**
+ * Memoized attribute card component
+ * Prevents re-renders when parent updates but attribute data hasn't changed
+ */
+const AttributeCard = memo<{ attr: ItemAttribute }>(({ attr }) => (
+  <div className="bg-muted/50 border rounded p-2 text-xs">
+    <div className="flex items-center justify-between mb-1">
+      <span className="font-medium text-muted-foreground uppercase">
+        {attr.attribute_name || attr.attribute_type}
+      </span>
+      {attr.confidence !== undefined && attr.confidence < 1.0 && (
+        <span className="text-muted-foreground">
+          {(attr.confidence * 100).toFixed(0)}%
+        </span>
+      )}
+    </div>
+    <div className="flex items-baseline gap-1">
+      <span className="font-semibold">{attr.attribute_value}</span>
+      {attr.unit && <span className="text-muted-foreground">{attr.unit}</span>}
+    </div>
+    {attr.original_text && (
+      <div className="text-muted-foreground mt-1 text-xs">
+        Из: "{attr.original_text}"
+      </div>
+    )}
+    <div className="mt-1">
+      <Badge variant="outline" className="text-xs">
+        {attr.attribute_type}
+      </Badge>
+    </div>
+  </div>
+))
+AttributeCard.displayName = 'AttributeCard'
+
+/**
+ * Memoized group item component
+ * Prevents re-renders when parent updates but item data hasn't changed
+ */
+const GroupItemCard = memo<{ item: GroupItem }>(({ item }) => (
+  <div className="bg-background border rounded p-3 space-y-2">
+    <div className="flex items-start justify-between">
+      <div className="flex-1">
+        <div className="font-medium text-sm">{item.source_name}</div>
+        <div className="text-xs text-muted-foreground mt-1">
+          Код: {item.code} | Reference: {item.source_reference}
+        </div>
+      </div>
+    </div>
+
+    {item.attributes && item.attributes.length > 0 && (
+      <div className="mt-2 pt-2 border-t">
+        <div className="text-xs font-medium text-muted-foreground mb-2">
+          Извлеченные атрибуты ({item.attributes.length}):
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
+          {item.attributes.map((attr) => (
+            <AttributeCard key={attr.id} attr={attr} />
+          ))}
+        </div>
+      </div>
+    )}
+  </div>
+))
+GroupItemCard.displayName = 'GroupItemCard'
+
+/**
+ * Memoized group row component
+ * Only re-renders when group data, expansion state, or items change
+ */
+interface GroupRowProps {
+  group: Group
+  isExpanded: boolean
+  items: GroupItem[]
+  isLoadingGroup: boolean
+  attributeCount: number
+  onToggleExpansion: () => void
+}
+
+const GroupRow = memo<GroupRowProps>(({
+  group,
+  isExpanded,
+  items,
+  isLoadingGroup,
+  attributeCount,
+  onToggleExpansion,
+}) => {
+  const groupKey = `${group.normalized_name}|${group.category}`
+
+  return (
+    <>
+      <TableRow key={groupKey}>
+        <TableCell>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-6 w-6"
+            onClick={onToggleExpansion}
+          >
+            {isExpanded ? (
+              <ChevronUp className="h-4 w-4" />
+            ) : (
+              <ChevronDown className="h-4 w-4" />
+            )}
+          </Button>
+        </TableCell>
+        <TableCell>
+          <div className="font-medium max-w-[400px] truncate" title={group.normalized_name}>
+            {group.normalized_name}
+          </div>
+        </TableCell>
+        <TableCell>
+          <Badge variant="outline">{group.category}</Badge>
+        </TableCell>
+        <TableCell>
+          {group.kpved_code ? (
+            <div className="space-y-1">
+              <div className="font-medium text-sm">{group.kpved_code}</div>
+              {group.kpved_name && (
+                <div className="text-xs text-muted-foreground max-w-[200px] truncate" title={group.kpved_name}>
+                  {group.kpved_name}
+                </div>
+              )}
+              {group.kpved_confidence !== undefined && (
+                <div className="text-xs text-muted-foreground">
+                  Уверенность: {(group.kpved_confidence * 100).toFixed(1)}%
+                </div>
+              )}
+            </div>
+          ) : (
+            <span className="text-muted-foreground text-sm">—</span>
+          )}
+        </TableCell>
+        <TableCell className="text-center">
+          <Badge variant="secondary">{group.merged_count}</Badge>
+        </TableCell>
+        <TableCell className="text-center">
+          {isExpanded ? (
+            <Badge variant={attributeCount > 0 ? 'default' : 'secondary'}>
+              {attributeCount}
+            </Badge>
+          ) : (
+            <span className="text-muted-foreground">—</span>
+          )}
+        </TableCell>
+      </TableRow>
+
+      {isExpanded && (
+        <TableRow>
+          <TableCell colSpan={6} className="bg-muted/30 p-0">
+            <div className="p-4 space-y-4">
+              {isLoadingGroup ? (
+                <div className="flex items-center justify-center py-4">
+                  <RefreshCw className="h-4 w-4 animate-spin text-muted-foreground" />
+                  <span className="ml-2 text-sm text-muted-foreground">Загрузка...</span>
+                </div>
+              ) : items.length === 0 ? (
+                <div className="text-center py-4 text-muted-foreground text-sm">
+                  Нет исходных записей
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <h4 className="text-sm font-medium">Исходные записи ({items.length}):</h4>
+                  <div className="space-y-2">
+                    {items.map((item) => (
+                      <GroupItemCard key={item.id} item={item} />
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          </TableCell>
+        </TableRow>
+      )}
+    </>
+  )
+})
+GroupRow.displayName = 'GroupRow'
 
 export function NormalizationResultsTable({ isRunning, database }: NormalizationResultsTableProps) {
   const [groups, setGroups] = useState<Group[]>([])
@@ -177,23 +359,22 @@ export function NormalizationResultsTable({ isRunning, database }: Normalization
     }
   }, [])
 
-  // Автообновление при работе процесса
+  // Загрузка данных и автообновление при работе процесса
   useEffect(() => {
+    // Начальная загрузка
     fetchGroups()
 
+    // Если процесс работает, запускаем polling
     if (isRunning) {
-      const interval = setInterval(() => {
-        fetchGroups()
-      }, 3000) // Обновляем каждые 3 секунды при работе процесса
-
+      const interval = setInterval(fetchGroups, 3000)
       return () => clearInterval(interval)
     }
-  }, [isRunning, fetchGroups])
+  }, [fetchGroups, isRunning])
 
-  const toggleGroupExpansion = (normalizedName: string, category: string) => {
+  const toggleGroupExpansion = useCallback((normalizedName: string, category: string) => {
     const groupKey = `${normalizedName}|${category}`
     const newExpanded = new Set(expandedGroups)
-    
+
     if (newExpanded.has(groupKey)) {
       newExpanded.delete(groupKey)
     } else {
@@ -201,14 +382,14 @@ export function NormalizationResultsTable({ isRunning, database }: Normalization
       // Загружаем элементы группы при раскрытии
       fetchGroupItems(normalizedName, category)
     }
-    
-    setExpandedGroups(newExpanded)
-  }
 
-  const getAttributeCount = (groupKey: string): number => {
+    setExpandedGroups(newExpanded)
+  }, [expandedGroups, fetchGroupItems])
+
+  const getAttributeCount = useCallback((groupKey: string): number => {
     const items = groupItems.get(groupKey) || []
     return items.reduce((count, item) => count + (item.attributes?.length || 0), 0)
-  }
+  }, [groupItems])
 
   const handlePageSizeChange = (newLimit: string) => {
     setLimit(Number(newLimit))
@@ -284,156 +465,16 @@ export function NormalizationResultsTable({ isRunning, database }: Normalization
             <TableBody>
               {groups.map((group) => {
                 const groupKey = `${group.normalized_name}|${group.category}`
-                const isExpanded = expandedGroups.has(groupKey)
-                const items = groupItems.get(groupKey) || []
-                const attributeCount = getAttributeCount(groupKey)
-                const isLoadingGroup = loadingItems.has(groupKey)
-
                 return (
-                  <>
-                    <TableRow key={groupKey}>
-                      <TableCell>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="h-6 w-6"
-                          onClick={() => toggleGroupExpansion(group.normalized_name, group.category)}
-                        >
-                          {isExpanded ? (
-                            <ChevronUp className="h-4 w-4" />
-                          ) : (
-                            <ChevronDown className="h-4 w-4" />
-                          )}
-                        </Button>
-                      </TableCell>
-                      <TableCell>
-                        <div className="font-medium max-w-[400px] truncate" title={group.normalized_name}>
-                          {group.normalized_name}
-                        </div>
-                      </TableCell>
-                      <TableCell>
-                        <Badge variant="outline">{group.category}</Badge>
-                      </TableCell>
-                      <TableCell>
-                        {group.kpved_code ? (
-                          <div className="space-y-1">
-                            <div className="font-medium text-sm">{group.kpved_code}</div>
-                            {group.kpved_name && (
-                              <div className="text-xs text-muted-foreground max-w-[200px] truncate" title={group.kpved_name}>
-                                {group.kpved_name}
-                              </div>
-                            )}
-                            {group.kpved_confidence !== undefined && (
-                              <div className="text-xs text-muted-foreground">
-                                Уверенность: {(group.kpved_confidence * 100).toFixed(1)}%
-                              </div>
-                            )}
-                          </div>
-                        ) : (
-                          <span className="text-muted-foreground text-sm">—</span>
-                        )}
-                      </TableCell>
-                      <TableCell className="text-center">
-                        <Badge variant="secondary">{group.merged_count}</Badge>
-                      </TableCell>
-                      <TableCell className="text-center">
-                        {isExpanded ? (
-                          <Badge variant={attributeCount > 0 ? 'default' : 'secondary'}>
-                            {attributeCount}
-                          </Badge>
-                        ) : (
-                          <span className="text-muted-foreground">—</span>
-                        )}
-                      </TableCell>
-                    </TableRow>
-
-                    {/* Раскрывающаяся секция с исходными записями и атрибутами */}
-                    {isExpanded && (
-                      <TableRow>
-                        <TableCell colSpan={6} className="bg-muted/30 p-0">
-                          <div className="p-4 space-y-4">
-                            {isLoadingGroup ? (
-                              <div className="flex items-center justify-center py-4">
-                                <RefreshCw className="h-4 w-4 animate-spin text-muted-foreground" />
-                                <span className="ml-2 text-sm text-muted-foreground">Загрузка...</span>
-                              </div>
-                            ) : items.length === 0 ? (
-                              <div className="text-center py-4 text-muted-foreground text-sm">
-                                Нет исходных записей
-                              </div>
-                            ) : (
-                              <>
-                                <div className="space-y-2">
-                                  <h4 className="text-sm font-medium">Исходные записи ({items.length}):</h4>
-                                  <div className="space-y-2">
-                                    {items.map((item) => (
-                                      <div
-                                        key={item.id}
-                                        className="bg-background border rounded p-3 space-y-2"
-                                      >
-                                        <div className="flex items-start justify-between">
-                                          <div className="flex-1">
-                                            <div className="font-medium text-sm">{item.source_name}</div>
-                                            <div className="text-xs text-muted-foreground mt-1">
-                                              Код: {item.code} | Reference: {item.source_reference}
-                                            </div>
-                                          </div>
-                                        </div>
-                                        
-                                        {/* Атрибуты элемента */}
-                                        {item.attributes && item.attributes.length > 0 && (
-                                          <div className="mt-2 pt-2 border-t">
-                                            <div className="text-xs font-medium text-muted-foreground mb-2">
-                                              Извлеченные атрибуты ({item.attributes.length}):
-                                            </div>
-                                            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
-                                              {item.attributes.map((attr) => (
-                                                <div
-                                                  key={attr.id}
-                                                  className="bg-muted/50 border rounded p-2 text-xs"
-                                                >
-                                                  <div className="flex items-center justify-between mb-1">
-                                                    <span className="font-medium text-muted-foreground uppercase">
-                                                      {attr.attribute_name || attr.attribute_type}
-                                                    </span>
-                                                    {attr.confidence !== undefined && attr.confidence < 1.0 && (
-                                                      <span className="text-muted-foreground">
-                                                        {(attr.confidence * 100).toFixed(0)}%
-                                                      </span>
-                                                    )}
-                                                  </div>
-                                                  <div className="flex items-baseline gap-1">
-                                                    <span className="font-semibold">{attr.attribute_value}</span>
-                                                    {attr.unit && (
-                                                      <span className="text-muted-foreground">{attr.unit}</span>
-                                                    )}
-                                                  </div>
-                                                  {attr.original_text && (
-                                                    <div className="text-muted-foreground mt-1 text-xs">
-                                                      Из: "{attr.original_text}"
-                                                    </div>
-                                                  )}
-                                                  <div className="mt-1">
-                                                    <Badge variant="outline" className="text-xs">
-                                                      {attr.attribute_type}
-                                                    </Badge>
-                                                  </div>
-                                                </div>
-                                              ))}
-                                            </div>
-                                          </div>
-                                        )}
-                                      </div>
-                                    ))}
-                                  </div>
-                                </div>
-                              </>
-                            )}
-                          </div>
-                        </TableCell>
-                      </TableRow>
-                    )}
-                  </>
+                  <GroupRow
+                    key={groupKey}
+                    group={group}
+                    isExpanded={expandedGroups.has(groupKey)}
+                    items={groupItems.get(groupKey) || []}
+                    isLoadingGroup={loadingItems.has(groupKey)}
+                    attributeCount={getAttributeCount(groupKey)}
+                    onToggleExpansion={() => toggleGroupExpansion(group.normalized_name, group.category)}
+                  />
                 )
               })}
             </TableBody>

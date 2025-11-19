@@ -249,7 +249,7 @@ export default function ResultsPage() {
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold">
-              {stats?.totalItems.toLocaleString() || 0}
+              {(stats?.totalItems ?? 0).toLocaleString()}
             </div>
             <p className="text-xs text-muted-foreground">
               элементов с разложенными атрибутами
@@ -263,7 +263,7 @@ export default function ResultsPage() {
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold">
-              {stats?.totalItemsWithAttributes?.toLocaleString() || 0}
+              {(stats?.totalItemsWithAttributes ?? 0).toLocaleString()}
             </div>
             <p className="text-xs text-muted-foreground">
               элементов с извлеченными размерами/брендами
@@ -277,7 +277,7 @@ export default function ResultsPage() {
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold">
-              {stats?.mergedItems.toLocaleString() || 0}
+              {(stats?.mergedItems ?? 0).toLocaleString()}
             </div>
             <p className="text-xs text-muted-foreground">
               дубликатов найдено и объединено

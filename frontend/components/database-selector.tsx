@@ -96,7 +96,9 @@ export function DatabaseSelector({
 
       const response = await fetch('/api/databases/list')
       if (!response.ok) {
-        throw new Error('Failed to fetch databases')
+        const errorText = await response.text().catch(() => 'Unknown error')
+        console.error('Failed to fetch databases:', errorText)
+        throw new Error(`Failed to fetch databases: ${response.status}`)
       }
 
       const data = await response.json()

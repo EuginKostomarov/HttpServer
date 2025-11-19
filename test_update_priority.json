@@ -1,0 +1,8 @@
+{
+  "action": "update_provider",
+  "data": {
+    "name": "arliai",
+    "priority": 2
+  }
+}
+

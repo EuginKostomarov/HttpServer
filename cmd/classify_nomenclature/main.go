@@ -91,8 +91,15 @@ func main() {
 		log.Fatal("ARLIAI_API_KEY не установлен в переменных окружения")
 	}
 
+	// Подключаемся к service.db для конфигурации
+	serviceDB, err := database.NewServiceDB("service.db")
+	if err != nil {
+		log.Fatalf("Ошибка подключения к service.db: %v", err)
+	}
+	defer serviceDB.Close()
+
 	// Создаем менеджер конфигурации для получения модели
-	configManager := server.NewWorkerConfigManager()
+	configManager := server.NewWorkerConfigManager(serviceDB)
 	
 	// Получаем модель из конфигурации
 	_, model, err := configManager.GetModelAndAPIKey()

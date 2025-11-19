@@ -47,7 +47,15 @@
       "Bash(python -m json.tool:*)",
       "Bash(cmd /c \"set ARLIAI_API_KEY=597dbe7e-16ca-4803-ab17-5fa084909f37 && start /B httpserver_new.exe\")",
       "Bash(cmd /c \"set ARLIAI_API_KEY=597dbe7e-16ca-4803-ab17-5fa084909f37 && cd /d E:\\HttpServer && go run test_kpved_integration.go\")",
-      "Bash(./test_kpved.bat)"
+      "Bash(./test_kpved.bat)",
+      "Bash(git stash pop:*)",
+      "Bash(go clean:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$(cat <<''EOF''\nCritical fix: Correct 19 KPVED classification codes (78% error rate)\n\nFixed all incorrect KPVED codes in keyword classifier that were causing\nsevere misclassifications. Major issues resolved:\n\n## Critical Errors Fixed:\n- Drills classified as tableware (25.99.12 → 25.73.40)\n- Reinforcement bars as cast iron ingots (24.10.11 → 24.10.61)\n- Building panels marked as NON-construction (23.69.19 → 23.61.11)\n\n## All Corrections (19 codes):\n\n**Tools (4 patterns):**\n- Keys: 25.73.11 → 25.73.30 (code didn''t exist)\n- Drills: 25.99.12 → 25.73.40 (was \"tableware\"!)\n- Milling cutters: 25.99.12 → 25.73.40\n- Crowns: 25.99.12 → 25.73.40\n\n**Bearings (1 pattern):**\n- Bearings: 28.15.32 → 28.15.10 (was \"chain parts\")\n\n**Building Materials (3 patterns):**\n- Panels: 23.69.19 → 23.61.11 (NON-construction → construction!)\n- Reinforcement: 24.10.11 → 24.10.61 (ingots → rods)\n- Shaped elements: 25.11.11 → 25.11.23 (code didn''t exist)\n\n**Electrical (2 patterns):**\n- Circuit breakers: 27.11.21 → 27.12.22 (motors → breakers)\n- Cables: 27.32.11 → 27.32.13 (winding wires → power cables)\n\n**Plumbing (2 patterns):**\n- Couplings: 28.14.11 → 24.20.40 (valves → fittings)\n- Tees: 28.14.11 → 24.20.40\n\n**Hydraulics (4 patterns):**\n- Pneumatic cylinders: 28.13.11 → 28.12.11 (pumps → cylinders)\n- Gearboxes: 28.15.11 → 28.15.24 (code didn''t exist)\n- Filters: 28.29.11 → 28.29.12 (gas generators → filters)\n- Seals: 28.29.12 → 28.29.23 (code conflict resolved)\n\n**Sandwich Panels (5 patterns):**\n- isowall, isopan, сэндвич, sandwich, изопан:\n  25.11.11 → 24.33.30 (code didn''t exist)\n\n**Other (1 pattern):**\n- Trays: 25.99.19 → 25.99.29 (code didn''t exist)\n\n## Error Categories:\n- 5 codes didn''t exist in KPVED database\n- 8 codes were completely wrong categories\n- 1 code was partially wrong\n- 1 code conflict (same code for different items)\n\n## Changes:\n- normalization/keyword_classifier.go: Fixed all 19 codes\n- normalization/*_test.go: Updated tests with correct codes\n- KPVED_OPTIMIZATION_USAGE.md: Updated documentation\n\n## Testing:\n✅ All 65 tests passing\n✅ Server compiles successfully\n✅ No regressions\n\n🤖 Generated with Claude Code\n\nCo-Authored-By: Claude <noreply@anthropic.com>\nEOF\n)\")",
+      "Bash(httpserver.exe)",
+      "Bash(powershell -ExecutionPolicy Bypass -Command \"$env:ARLIAI_API_KEY=''597dbe7e-16ca-4803-ab17-5fa084909f37''; Start-Process -FilePath ''.\\httpserver.exe'' -WindowStyle Normal\" -WorkingDirectory \"E:\\HttpServer\")",
+      "Bash(cmd.exe /c \"cd /d E:\\HttpServer && set ARLIAI_API_KEY=597dbe7e-16ca-4803-ab17-5fa084909f37 && start /B httpserver.exe\")",
+      "Bash(cmd.exe /c \"set ARLIAI_API_KEY=597dbe7e-16ca-4803-ab17-5fa084909f37 && httpserver.exe 2>&1 | head -20\")"
     ],
     "deny": [],
     "ask": []

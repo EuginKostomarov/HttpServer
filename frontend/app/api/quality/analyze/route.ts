@@ -1,16 +1,22 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { qualityAnalyzeSchema, validateRequest, formatValidationError } from '@/lib/validation'
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || process.env.BACKEND_URL || 'http://localhost:9999'
+const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:9999'
 
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json()
-    
+
     console.log('Proxying POST /api/quality/analyze to backend')
-    
-    if (!body) {
+
+    // Validate request body
+    const validation = validateRequest(qualityAnalyzeSchema, body)
+    if (!validation.success) {
       return NextResponse.json(
-        { error: 'Request body is required' },
+        {
+          error: 'Validation failed',
+          details: formatValidationError(validation.details)
+        },
         { status: 400 }
       )
     }
@@ -20,7 +26,7 @@ export async function POST(request: NextRequest) {
       headers: {
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify(validation.data),
     })
 
     if (!response.ok) {

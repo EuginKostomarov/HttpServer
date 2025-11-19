@@ -1,0 +1,10 @@
+{
+  "action": "update_model",
+  "data": {
+    "provider": "arliai",
+    "name": "GLM-4.5",
+    "enabled": false,
+    "priority": 2
+  }
+}
+

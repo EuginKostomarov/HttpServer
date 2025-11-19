@@ -164,6 +164,11 @@ func InitSchema(db *sql.DB) error {
 		return fmt.Errorf("failed to migrate quality fields: %w", err)
 	}
 
+	// Добавляем поля для отслеживания стадий обработки в normalized_data
+	if err := MigrateNormalizedDataStageFields(db); err != nil {
+		return fmt.Errorf("failed to migrate stage tracking fields: %w", err)
+	}
+
 	// Создаем таблицы системы качества (DQAS)
 	if err := CreateQualityAssessmentsTables(db); err != nil {
 		return fmt.Errorf("failed to create quality assessment tables: %w", err)

@@ -49,3 +49,153 @@ export function handleApiError(error: unknown, fallbackKey: ErrorMessageKey = 'U
 
   return ERROR_MESSAGES[fallbackKey]
 }
+
+// ============================================================================
+// Advanced Error Handling for API Routes
+// ============================================================================
+
+import { NextResponse } from 'next/server'
+
+/**
+ * Custom application error class
+ */
+export class AppError extends Error {
+  constructor(
+    message: string,
+    public statusCode: number = 500,
+    public code?: string,
+    public details?: unknown
+  ) {
+    super(message)
+    this.name = 'AppError'
+    Error.captureStackTrace(this, this.constructor)
+  }
+}
+
+export class ValidationError extends AppError {
+  constructor(message: string, details?: unknown) {
+    super(message, 400, 'VALIDATION_ERROR', details)
+    this.name = 'ValidationError'
+  }
+}
+
+export class UnauthorizedError extends AppError {
+  constructor(message: string = 'Unauthorized') {
+    super(message, 401, 'UNAUTHORIZED')
+    this.name = 'UnauthorizedError'
+  }
+}
+
+export class BackendError extends AppError {
+  constructor(message: string, statusCode: number = 502, details?: unknown) {
+    super(message, statusCode, 'BACKEND_ERROR', details)
+    this.name = 'BackendError'
+  }
+}
+
+/**
+ * Error response structure
+ */
+interface ErrorResponse {
+  error: string
+  code?: string
+  details?: unknown
+  timestamp?: string
+  path?: string
+}
+
+/**
+ * Creates a standardized error response for API routes
+ */
+export function createErrorResponse(
+  error: Error | AppError | unknown,
+  options?: {
+    includeStack?: boolean
+    path?: string
+  }
+): NextResponse<ErrorResponse> {
+  const isDevelopment = process.env.NODE_ENV === 'development'
+  const includeStack = options?.includeStack ?? isDevelopment
+
+  // Handle AppError instances
+  if (error instanceof AppError) {
+    const response: ErrorResponse = {
+      error: error.message,
+      code: error.code,
+      timestamp: new Date().toISOString(),
+    }
+
+    if (error.details) {
+      response.details = error.details
+    }
+
+    if (options?.path) {
+      response.path = options.path
+    }
+
+    if (includeStack && error.stack) {
+      response.details = {
+        ...(typeof response.details === 'object' ? response.details : {}),
+        stack: error.stack,
+      }
+    }
+
+    return NextResponse.json(response, { status: error.statusCode })
+  }
+
+  // Handle standard Error instances
+  if (error instanceof Error) {
+    const response: ErrorResponse = {
+      error: isDevelopment ? error.message : 'Internal server error',
+      code: 'INTERNAL_ERROR',
+      timestamp: new Date().toISOString(),
+    }
+
+    if (options?.path) {
+      response.path = options.path
+    }
+
+    if (includeStack && error.stack) {
+      response.details = { stack: error.stack }
+    }
+
+    return NextResponse.json(response, { status: 500 })
+  }
+
+  // Handle unknown errors
+  const response: ErrorResponse = {
+    error: 'An unexpected error occurred',
+    code: 'UNKNOWN_ERROR',
+    timestamp: new Date().toISOString(),
+  }
+
+  if (options?.path) {
+    response.path = options.path
+  }
+
+  if (isDevelopment && error) {
+    response.details = error
+  }
+
+  return NextResponse.json(response, { status: 500 })
+}
+
+/**
+ * Wraps an async route handler with error handling
+ */
+export function withErrorHandler<T extends (...args: any[]) => Promise<NextResponse>>(
+  handler: T
+): T {
+  return (async (...args: Parameters<T>) => {
+    try {
+      return await handler(...args)
+    } catch (error) {
+      console.error('API Route Error:', error)
+
+      const request = args[0]
+      const path = request?.url ? new URL(request.url).pathname : undefined
+
+      return createErrorResponse(error, { path })
+    }
+  }) as T
+}

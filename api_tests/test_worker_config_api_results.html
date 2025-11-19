@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Worker Config API - Результаты тестирования</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+        .container { max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        h1 { color: #333; border-bottom: 3px solid #4CAF50; padding-bottom: 10px; }
+        h2 { color: #555; margin-top: 30px; }
+        .test-section { margin: 20px 0; padding: 15px; background: #f9f9f9; border-left: 4px solid #2196F3; }
+        .success { border-left-color: #4CAF50; background: #e8f5e9; }
+        .warning { border-left-color: #FF9800; background: #fff3e0; }
+        .error { border-left-color: #f44336; background: #ffebee; }
+        .code { background: #263238; color: #aed581; padding: 15px; border-radius: 4px; overflow-x: auto; font-family: 'Courier New', monospace; }
+        .status { display: inline-block; padding: 5px 10px; border-radius: 4px; font-weight: bold; margin: 5px 0; }
+        .status-success { background: #4CAF50; color: white; }
+        .status-pending { background: #FF9800; color: white; }
+        .status-error { background: #f44336; color: white; }
+        table { width: 100%; border-collapse: collapse; margin: 15px 0; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background-color: #2196F3; color: white; }
+        tr:hover { background-color: #f5f5f5; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔧 Worker Config API - Результаты тестирования</h1>
+        <p><strong>Дата:</strong> 2025-11-17</p>
+        <p><strong>Версия:</strong> С исправлениями частичных обновлений</p>
+
+        <h2>📋 Обзор тестирования</h2>
+        <table>
+            <tr>
+                <th>Тест</th>
+                <th>Статус</th>
+                <th>Результат</th>
+            </tr>
+            <tr>
+                <td>Запуск backend сервера</td>
+                <td><span class="status status-success">✅ Успешно</span></td>
+                <td>Сервер запущен на порту 9999, health check работает</td>
+            </tr>
+            <tr>
+                <td>GET /api/workers/config</td>
+                <td><span class="status status-success">✅ Успешно</span></td>
+                <td>Конфигурация возвращается, API ключи скрыты, has_api_key установлен</td>
+            </tr>
+            <tr>
+                <td>POST /api/workers/config/update</td>
+                <td><span class="status status-error">❌ Проблема</span></td>
+                <td>Запросы зависают (таймаут 10-15 сек). Требуется отладка.</td>
+            </tr>
+            <tr>
+                <td>Сохранение API ключа</td>
+                <td><span class="status status-pending">⏳ Ожидает</span></td>
+                <td>Не может быть протестировано из-за проблемы с POST</td>
+            </tr>
+            <tr>
+                <td>Изменение priority/workers/enabled</td>
+                <td><span class="status status-pending">⏳ Ожидает</span></td>
+                <td>Не может быть протестировано из-за проблемы с POST</td>
+            </tr>
+            <tr>
+                <td>Валидация</td>
+                <td><span class="status status-pending">⏳ Ожидает</span></td>
+                <td>Не может быть протестировано из-за проблемы с POST</td>
+            </tr>
+        </table>
+
+        <h2>✅ Успешные тесты</h2>
+
+        <div class="test-section success">
+            <h3>1. Запуск Backend сервера</h3>
+            <p><strong>Статус:</strong> <span class="status status-success">✅ Успешно</span></p>
+            <p>Сервер успешно запущен с переменной окружения ARLIAI_API_KEY на порту 9999.</p>
+            <p><strong>Проверка:</strong></p>
+            <div class="code">
+GET http://localhost:9999/health
+Response: 200 OK
+{"status":"healthy","time":"2025-11-17T14:59:42+03:00"}
+            </div>
+        </div>
+
+        <div class="test-section success">
+            <h3>2. GET /api/workers/config</h3>
+            <p><strong>Статус:</strong> <span class="status status-success">✅ Успешно</span></p>
+            <p>Endpoint возвращает конфигурацию воркеров с правильной структурой.</p>
+            <p><strong>Проверенные аспекты:</strong></p>
+            <ul>
+                <li>✅ Конфигурация возвращается в формате JSON</li>
+                <li>✅ Поле <code>has_api_key</code> установлено правильно (true для arliai)</li>
+                <li>✅ API ключи скрыты в ответе (не возвращаются в поле <code>api_key</code>)</li>
+                <li>✅ Структура конфигурации корректна (providers, default_provider, default_model, global_max_workers)</li>
+            </ul>
+            <p><strong>Пример ответа:</strong></p>
+            <div class="code">
+{
+  "default_provider": "arliai",
+  "default_model": "GLM-4.5-Air",
+  "global_max_workers": 2,
+  "providers": {
+    "arliai": {
+      "name": "arliai",
+      "enabled": true,
+      "priority": 1,
+      "max_workers": 2,
+      "has_api_key": true,
+      // api_key отсутствует (скрыт)
+    }
+  }
+}
+            </div>
+        </div>
+
+        <h2>❌ Проблемы</h2>
+
+        <div class="test-section error">
+            <h3>POST /api/workers/config/update - Зависание запросов</h3>
+            <p><strong>Статус:</strong> <span class="status status-error">❌ Критическая проблема</span></p>
+            <p><strong>Описание:</strong> Все POST запросы к endpoint /api/workers/config/update зависают и не возвращают ответ в течение 10-15 секунд (таймаут).</p>
+            
+            <p><strong>Протестированные сценарии:</strong></p>
+            <ul>
+                <li>❌ Изменение priority: <code>{"action":"update_provider","data":{"name":"arliai","priority":3}}</code></li>
+                <li>❌ Изменение max_workers: <code>{"action":"update_provider","data":{"name":"arliai","max_workers":5}}</code></li>
+                <li>❌ Сохранение API ключа: <code>{"action":"update_provider","data":{"name":"arliai","api_key":"test-key"}}</code></li>
+                <li>❌ set_max_workers: <code>{"action":"set_max_workers","data":{"max_workers":5}}</code></li>
+            </ul>
+
+            <p><strong>Возможные причины:</strong></p>
+            <ul>
+                <li>Блокировка базы данных (SQLite busy timeout)</li>
+                <li>Deadlock в блокировках (mutex)</li>
+                <li>Проблема в методе <code>saveConfigUnlocked()</code> или <code>SaveWorkerConfig()</code></li>
+                <li>Проблема с операцией <code>mapToStruct()</code> или десериализацией</li>
+            </ul>
+
+            <p><strong>Рекомендации для отладки:</strong></p>
+            <ol>
+                <li>Проверить логи сервера на наличие ошибок или зависаний</li>
+                <li>Проверить, не заблокирована ли БД другим процессом</li>
+                <li>Добавить больше логирования в <code>handleUpdateWorkerConfig</code> и <code>UpdateProviderPartial</code></li>
+                <li>Проверить, нет ли deadlock в блокировках (Lock/RLock)</li>
+                <li>Проверить работу <code>SaveWorkerConfig</code> отдельно</li>
+            </ol>
+        </div>
+
+        <h2>📝 Реализованные исправления</h2>
+
+        <div class="test-section">
+            <h3>Frontend (frontend/app/workers/page.tsx)</h3>
+            <ul>
+                <li>✅ <code>toggleProvider</code> - отправляет только <code>{name, enabled}</code></li>
+                <li>✅ <code>updateProviderPriority</code> - отправляет только <code>{name, priority}</code></li>
+                <li>✅ <code>updateProviderWorkers</code> - отправляет только <code>{name, max_workers}</code></li>
+            </ul>
+        </div>
+
+        <div class="test-section">
+            <h3>Backend (server/worker_config.go)</h3>
+            <ul>
+                <li>✅ Создана структура <code>ProviderConfigUpdate</code> с pointer типами</li>
+                <li>✅ Реализован метод <code>UpdateProviderPartial()</code> с валидацией</li>
+                <li>✅ Добавлено детальное логирование изменений (старое → новое)</li>
+                <li>✅ API ключ не логируется, только длина</li>
+            </ul>
+        </div>
+
+        <div class="test-section">
+            <h3>API Handler (server/server_worker_config.go)</h3>
+            <ul>
+                <li>✅ Обработчик использует <code>ProviderConfigUpdate</code></li>
+                <li>✅ Вызывает <code>UpdateProviderPartial()</code> вместо <code>UpdateProvider()</code></li>
+                <li>✅ Логирует только переданные поля</li>
+            </ul>
+        </div>
+
+        <h2>🎯 Следующие шаги</h2>
+
+        <div class="test-section warning">
+            <h3>Требуется отладка POST запросов</h3>
+            <p>Перед продолжением тестирования необходимо решить проблему с зависанием POST запросов.</p>
+            <p><strong>Приоритетные задачи:</strong></p>
+            <ol>
+                <li>Отладить проблему с POST /api/workers/config/update</li>
+                <li>Протестировать сохранение API ключа</li>
+                <li>Протестировать изменение priority/workers/enabled</li>
+                <li>Протестировать удаление API ключа</li>
+                <li>Протестировать валидацию</li>
+                <li>Протестировать страницу /workers через frontend</li>
+            </ol>
+        </div>
+
+        <h2>📊 Статистика</h2>
+        <table>
+            <tr>
+                <th>Категория</th>
+                <th>Успешно</th>
+                <th>Проблемы</th>
+                <th>Ожидает</th>
+            </tr>
+            <tr>
+                <td>Backend запуск</td>
+                <td>1</td>
+                <td>0</td>
+                <td>0</td>
+            </tr>
+            <tr>
+                <td>GET endpoints</td>
+                <td>1</td>
+                <td>0</td>
+                <td>0</td>
+            </tr>
+            <tr>
+                <td>POST endpoints</td>
+                <td>0</td>
+                <td>1</td>
+                <td>0</td>
+            </tr>
+            <tr>
+                <td>Функциональные тесты</td>
+                <td>0</td>
+                <td>0</td>
+                <td>6</td>
+            </tr>
+            <tr>
+                <td><strong>Итого</strong></td>
+                <td><strong>2</strong></td>
+                <td><strong>1</strong></td>
+                <td><strong>6</strong></td>
+            </tr>
+        </table>
+    </div>
+</body>
+</html>
+
