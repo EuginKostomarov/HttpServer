@@ -64,7 +64,7 @@ export function validateRequest<T>(
  * Formats Zod validation errors for user-friendly display
  */
 export function formatValidationError(error: z.ZodError): string {
-  const messages = error.errors.map(err => {
+  const messages = error.issues.map(err => {
     const path = err.path.join('.')
     return path ? `${path}: ${err.message}` : err.message
   })

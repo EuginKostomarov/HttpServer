@@ -84,19 +84,30 @@ type AIProcessingResult struct {
 
 // NewAIClient создает новый клиент для работы с Arliai API
 func NewAIClient(apiKey, model string) *AIClient {
-	// Rate limiter: 60 запросов в минуту (1 запрос/сек) с burst=5
-	// Это защищает от превышения квот API и неконтролируемых расходов
-	limiter := rate.NewLimiter(rate.Every(time.Second), 5)
+	// Rate limiter: 2 запроса/сек (120 запросов/мин) с burst=10
+	// Это позволяет лучше использовать доступные 2 параллельных вызова Arliai API ADVANCED плана
+	// Burst=10 позволяет быстро обработать накопившиеся запросы при старте
+	limiter := rate.NewLimiter(rate.Limit(2.0), 10)
 
 	// Circuit Breaker: защита от каскадных сбоев
 	// - 5 ошибок подряд -> открываем breaker (блокируем запросы)
-	// - Ждем 30 секунд перед попыткой восстановления
+	// - Ждем 15 секунд перед попыткой восстановления (уменьшено с 30s для ускорения)
 	// - 2 успешных запроса -> закрываем breaker (нормальная работа)
 	breaker := &CircuitBreaker{
 		state:            StateClosed,
 		failureThreshold: 5,
 		successThreshold: 2,
-		timeout:          30 * time.Second,
+		timeout:          15 * time.Second,
+	}
+
+	// Оптимизированный HTTP Transport с connection pooling для переиспользования соединений
+	transport := &http.Transport{
+		MaxIdleConns:        10,
+		MaxConnsPerHost:     5,
+		IdleConnTimeout:     90 * time.Second,
+		DisableKeepAlives:   false,
+		DisableCompression:  false,
+		MaxIdleConnsPerHost: 5,
 	}
 
 	return &AIClient{
@@ -104,7 +115,8 @@ func NewAIClient(apiKey, model string) *AIClient {
 		baseURL: "https://api.arliai.com/v1/chat/completions",
 		model:   model,
 		httpClient: &http.Client{
-			Timeout: 60 * time.Second, // Увеличиваем таймаут для больших классификаторов
+			Timeout:   60 * time.Second, // Увеличиваем таймаут для больших классификаторов
+			Transport: transport,
 		},
 		rateLimiter:    limiter,
 		circuitBreaker: breaker,
@@ -482,6 +494,77 @@ func (c *AIClient) GetCircuitBreakerState() map[string]interface{} {
 		"failure_count":    c.circuitBreaker.failureCount,
 		"success_count":    c.circuitBreaker.successCount,
 		"last_failure_time": lastFailureTime,
+	}
+}
+
+// WaitForCircuitBreakerRecovery ждет, пока circuit breaker восстановится (перейдет в half-open или closed)
+// Возвращает true если circuit breaker готов к работе, false если произошла ошибка или таймаут
+func (c *AIClient) WaitForCircuitBreakerRecovery(maxWaitTime time.Duration) bool {
+	if c.circuitBreaker == nil {
+		return true // Если circuit breaker не включен, считаем что все готово
+	}
+
+	startTime := time.Now()
+	checkInterval := 500 * time.Millisecond // Интервал проверки состояния
+
+	for {
+		// Проверяем общий таймаут
+		if time.Since(startTime) > maxWaitTime {
+			return false // Превышен максимальный срок ожидания
+		}
+
+		c.circuitBreaker.mu.RLock()
+		state := c.circuitBreaker.state
+		lastFailureTime := c.circuitBreaker.lastFailureTime
+		timeout := c.circuitBreaker.timeout
+		c.circuitBreaker.mu.RUnlock()
+
+		// Если circuit breaker закрыт или в half-open, можно продолжать
+		if state == StateClosed || state == StateHalfOpen {
+			return true
+		}
+
+		// Если circuit breaker открыт, вычисляем время до восстановления
+		if state == StateOpen {
+			timeSinceFailure := time.Since(lastFailureTime)
+			
+			// Если уже прошло достаточно времени, проверяем canProceed для перехода в half-open
+			if timeSinceFailure >= timeout {
+				if c.circuitBreaker.canProceed() {
+					return true
+				}
+				// Если canProceed вернул false, продолжаем ждать
+				time.Sleep(checkInterval)
+				continue
+			}
+
+			// Вычисляем оставшееся время до восстановления
+			remainingTime := timeout - timeSinceFailure
+			
+			// Проверяем, не превысит ли ожидание общий таймаут
+			elapsed := time.Since(startTime)
+			if elapsed+remainingTime > maxWaitTime {
+				// Общий таймаут будет превышен, выходим
+				return false
+			}
+
+			// Ждем оставшееся время до восстановления + небольшая задержка для безопасности
+			waitTime := remainingTime + 100*time.Millisecond
+			if waitTime > maxWaitTime-elapsed {
+				waitTime = maxWaitTime - elapsed
+			}
+			
+			// Создаем таймер для ожидания
+			timer := time.NewTimer(waitTime)
+			select {
+			case <-timer.C:
+				// Время прошло, проверяем состояние снова
+				continue
+			}
+		}
+
+		// Для других состояний просто ждем и проверяем снова
+		time.Sleep(checkInterval)
 	}
 }
 

@@ -41,6 +41,7 @@ export function useWorkerConfig() {
   const [refreshingModels, setRefreshingModels] = useState<Record<string, boolean>>({})
   const [savingApiKey, setSavingApiKey] = useState<Record<string, boolean>>({})
   const successTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+  const refreshingRef = useRef<Record<string, boolean>>({}) // Ref для отслеживания активных обновлений
 
   const fetchConfig = useCallback(async () => {
     setLoading(true)
@@ -102,6 +103,47 @@ export function useWorkerConfig() {
       setSaving(false)
     }
   }, [config])
+
+  const refreshModels = useCallback(async (providerName: string) => {
+    // Защита от повторных вызовов
+    if (refreshingRef.current[providerName]) {
+      return // Уже обновляется, не вызываем повторно
+    }
+    
+    refreshingRef.current[providerName] = true
+    setRefreshingModels((prev) => ({ ...prev, [providerName]: true }))
+
+    try {
+      const response = await fetch(`/api/workers/${providerName}/models`, {
+        cache: 'no-store',
+      })
+
+      if (!response.ok) {
+        throw new Error('Не удалось обновить список моделей')
+      }
+
+      const data = await response.json()
+
+      setConfig((prev) => {
+        if (!prev) return prev
+        return {
+          ...prev,
+          providers: {
+            ...prev.providers,
+            [providerName]: {
+              ...prev.providers[providerName],
+              available_models: data.models || [],
+            },
+          },
+        }
+      })
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Ошибка обновления моделей')
+    } finally {
+      refreshingRef.current[providerName] = false
+      setRefreshingModels((prev) => ({ ...prev, [providerName]: false }))
+    }
+  }, [])
 
   const testAPIKey = useCallback(
     async (providerName: string) => {
@@ -173,9 +215,12 @@ export function useWorkerConfig() {
           },
         }))
 
-        // Auto-refresh models if connected
+        // Auto-refresh models if connected (только если еще не обновляется)
         if (data.connected && providerName === 'arliai') {
-          setTimeout(() => refreshModels(providerName), 500)
+          // Проверяем, не идет ли уже обновление
+          if (!refreshingRef.current[providerName]) {
+            setTimeout(() => refreshModels(providerName), 500)
+          }
         }
       } catch (err) {
         const errorMessage = err instanceof Error ? err.message : 'Ошибка проверки подключения'
@@ -190,42 +235,8 @@ export function useWorkerConfig() {
         }))
       }
     },
-    [config]
+    [config, refreshModels]
   )
-
-  const refreshModels = useCallback(async (providerName: string) => {
-    setRefreshingModels((prev) => ({ ...prev, [providerName]: true }))
-
-    try {
-      const response = await fetch(`/api/workers/${providerName}/models`, {
-        cache: 'no-store',
-      })
-
-      if (!response.ok) {
-        throw new Error('Не удалось обновить список моделей')
-      }
-
-      const data = await response.json()
-
-      setConfig((prev) => {
-        if (!prev) return prev
-        return {
-          ...prev,
-          providers: {
-            ...prev.providers,
-            [providerName]: {
-              ...prev.providers[providerName],
-              available_models: data.models || [],
-            },
-          },
-        }
-      })
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Ошибка обновления моделей')
-    } finally {
-      setRefreshingModels((prev) => ({ ...prev, [providerName]: false }))
-    }
-  }, [])
 
   const toggleProvider = useCallback((providerName: string) => {
     setExpandedProviders((prev) => {
@@ -266,7 +277,8 @@ export function useWorkerConfig() {
         clearTimeout(successTimeoutRef.current)
       }
     }
-  }, [fetchConfig])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []) // Вызываем только при монтировании
 
   return {
     config,

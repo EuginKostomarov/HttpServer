@@ -2,7 +2,9 @@ package classification
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestCategoryNode(t *testing.T) {
@@ -439,6 +441,205 @@ func TestAIClassifierCodeExists(t *testing.T) {
 
 // Примечание: Тесты для ClassifyWithAI требуют моки AI клиента
 // и будут добавлены в интеграционных тестах
+
+func TestAIClassifierBuildCompactCategoryList(t *testing.T) {
+	classifier := NewAIClassifier("test_api_key", "GLM-4.5-Air")
+	
+	// Создаем дерево с несколькими категориями
+	root := NewCategoryNode("root", "Root", "/root", 0)
+	
+	// Добавляем категории с разными длинами названий
+	category1 := NewCategoryNode("cat1", "Категория 1", "/root/cat1", 1)
+	category2 := NewCategoryNode("cat2", "Категория 2", "/root/cat2", 1)
+	category3 := NewCategoryNode("cat3", "Очень длинное название категории которое должно быть обрезано если превышает 50 символов", "/root/cat3", 1)
+	
+	root.AddChild(category1)
+	root.AddChild(category2)
+	root.AddChild(category3)
+	
+	classifier.SetClassifierTree(root)
+	
+	// Тест с ограничением до 2 категорий
+	result := classifier.buildCompactCategoryList(2)
+	
+	// Проверяем, что результат содержит категории
+	if !strings.Contains(result, "Категория 1") {
+		t.Errorf("Expected result to contain 'Категория 1'")
+	}
+	if !strings.Contains(result, "Категория 2") {
+		t.Errorf("Expected result to contain 'Категория 2'")
+	}
+	
+	// Проверяем, что длинное название обрезано
+	if strings.Contains(result, "Очень длинное название категории которое должно быть обрезано если превышает 50 символов") {
+		t.Errorf("Expected long category name to be truncated")
+	}
+	
+	// Проверяем формат (должен быть через запятую)
+	if !strings.Contains(result, ",") {
+		t.Errorf("Expected result to contain comma separator")
+	}
+}
+
+func TestAIClassifierEstimateTokens(t *testing.T) {
+	classifier := NewAIClassifier("test_api_key", "GLM-4.5-Air")
+	
+	// Тест с коротким текстом
+	shortText := "Короткий текст"
+	tokens := classifier.estimateTokens(shortText)
+	if tokens <= 0 {
+		t.Errorf("Expected positive token count, got %d", tokens)
+	}
+	
+	// Тест с длинным текстом
+	longText := strings.Repeat("Тест ", 100) // 500 символов
+	tokens = classifier.estimateTokens(longText)
+	if tokens <= 0 {
+		t.Errorf("Expected positive token count for long text, got %d", tokens)
+	}
+	
+	// Проверяем, что для длинного текста токенов больше
+	if tokens <= classifier.estimateTokens(shortText) {
+		t.Errorf("Expected more tokens for longer text")
+	}
+}
+
+func TestAIClassifierGetCacheStats(t *testing.T) {
+	classifier := NewAIClassifier("test_api_key", "GLM-4.5-Air")
+	
+	// Изначально статистика должна быть нулевой
+	hits, misses := classifier.GetCacheStats()
+	if hits != 0 || misses != 0 {
+		t.Errorf("Expected initial cache stats to be (0, 0), got (%d, %d)", hits, misses)
+	}
+}
+
+func TestAIClassifierCacheBehavior(t *testing.T) {
+	classifier := NewAIClassifier("test_api_key", "GLM-4.5-Air")
+	
+	// Создаем дерево
+	root := NewCategoryNode("root", "Root", "/root", 0)
+	category1 := NewCategoryNode("cat1", "Категория 1", "/root/cat1", 1)
+	root.AddChild(category1)
+	classifier.SetClassifierTree(root)
+	
+	// Первый вызов - должен быть cache miss
+	summary1 := classifier.summarizeClassifierTree()
+	if summary1 == "" {
+		t.Errorf("Expected non-empty summary")
+	}
+	
+	hits, misses := classifier.GetCacheStats()
+	if misses != 1 {
+		t.Errorf("Expected 1 cache miss after first call, got %d", misses)
+	}
+	if hits != 0 {
+		t.Errorf("Expected 0 cache hits after first call, got %d", hits)
+	}
+	
+	// Второй вызов - должен быть cache hit
+	summary2 := classifier.summarizeClassifierTree()
+	if summary1 != summary2 {
+		t.Errorf("Expected cached summary to match first call")
+	}
+	
+	hits, misses = classifier.GetCacheStats()
+	if hits != 1 {
+		t.Errorf("Expected 1 cache hit after second call, got %d", hits)
+	}
+	if misses != 1 {
+		t.Errorf("Expected 1 cache miss (unchanged), got %d", misses)
+	}
+	
+	// Изменяем дерево - кэш должен сброситься
+	classifier.SetClassifierTree(root)
+	
+	// Проверяем, что кэш сброшен (следующий вызов будет miss)
+	// Но счетчики не сбрасываются, только кэш
+	summary3 := classifier.summarizeClassifierTree()
+	if summary3 == "" {
+		t.Errorf("Expected non-empty summary after tree reset")
+	}
+}
+
+func TestAIClassifierBuildCompactCategoryListEmpty(t *testing.T) {
+	classifier := NewAIClassifier("test_api_key", "GLM-4.5-Air")
+	
+	// Тест с nil деревом
+	result := classifier.buildCompactCategoryList(10)
+	if result != "Нет категорий" {
+		t.Errorf("Expected 'Нет категорий' for nil tree, got '%s'", result)
+	}
+	
+	// Тест с пустым деревом
+	root := NewCategoryNode("root", "Root", "/root", 0)
+	classifier.SetClassifierTree(root)
+	
+	result = classifier.buildCompactCategoryList(10)
+	if result != "Нет категорий" {
+		t.Errorf("Expected 'Нет категорий' for empty tree, got '%s'", result)
+	}
+}
+
+func TestAIClassifierConfig(t *testing.T) {
+	classifier := NewAIClassifier("test_api_key", "GLM-4.5-Air")
+	
+	// Проверяем значения по умолчанию
+	config := classifier.GetConfig()
+	if config.MaxCategories != 15 {
+		t.Errorf("Expected default MaxCategories=15, got %d", config.MaxCategories)
+	}
+	if config.MaxCategoryNameLen != 50 {
+		t.Errorf("Expected default MaxCategoryNameLen=50, got %d", config.MaxCategoryNameLen)
+	}
+	if !config.EnableLogging {
+		t.Errorf("Expected default EnableLogging=true, got %v", config.EnableLogging)
+	}
+	
+	// Тест установки новой конфигурации
+	newConfig := AIClassifierConfig{
+		MaxCategories:      10,
+		MaxCategoryNameLen: 30,
+		EnableLogging:      false,
+	}
+	classifier.SetConfig(newConfig)
+	
+	updatedConfig := classifier.GetConfig()
+	if updatedConfig.MaxCategories != 10 {
+		t.Errorf("Expected MaxCategories=10 after SetConfig, got %d", updatedConfig.MaxCategories)
+	}
+	if updatedConfig.MaxCategoryNameLen != 30 {
+		t.Errorf("Expected MaxCategoryNameLen=30 after SetConfig, got %d", updatedConfig.MaxCategoryNameLen)
+	}
+	if updatedConfig.EnableLogging {
+		t.Errorf("Expected EnableLogging=false after SetConfig, got %v", updatedConfig.EnableLogging)
+	}
+}
+
+func TestAIClassifierPerformanceStats(t *testing.T) {
+	classifier := NewAIClassifier("test_api_key", "GLM-4.5-Air")
+	
+	// Изначально статистика должна быть нулевой
+	requests, avgLatency := classifier.GetPerformanceStats()
+	if requests != 0 {
+		t.Errorf("Expected initial requests=0, got %d", requests)
+	}
+	if avgLatency != 0 {
+		t.Errorf("Expected initial avgLatency=0, got %v", avgLatency)
+	}
+	
+	// Симулируем обновление метрик (в реальности это делается в ClassifyWithAI)
+	classifier.updatePerformanceMetrics(100 * time.Millisecond)
+	classifier.updatePerformanceMetrics(200 * time.Millisecond)
+	
+	requests, avgLatency = classifier.GetPerformanceStats()
+	if requests != 2 {
+		t.Errorf("Expected requests=2, got %d", requests)
+	}
+	if avgLatency < 100*time.Millisecond || avgLatency > 200*time.Millisecond {
+		t.Errorf("Expected avgLatency between 100ms and 200ms, got %v", avgLatency)
+	}
+}
 
 func TestBaseFoldingStrategy(t *testing.T) {
 	strategy := NewBaseFoldingStrategy("test", "Test Strategy", "Test description", 2)

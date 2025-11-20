@@ -80,3 +80,4 @@ set PATH_TO_1C=C:\Program Files\1cv8\8.3.25.1234\bin\1cv8.exe
 
 
 
+

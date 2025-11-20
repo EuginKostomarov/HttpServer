@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
+import { getBackendUrl } from '@/lib/api-config'
 
-const API_BASE_URL = process.env.BACKEND_URL || 'http://localhost:9999'
+const API_BASE_URL = getBackendUrl()
 
 export async function POST(
   request: Request,
@@ -8,11 +9,14 @@ export async function POST(
 ) {
   try {
     const { clientId, projectId } = await params
+    const body = await request.json().catch(() => ({}))
+    
     const response = await fetch(`${API_BASE_URL}/api/clients/${clientId}/projects/${projectId}/normalization/start`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
       },
+      body: JSON.stringify(body),
     })
 
     if (!response.ok) {

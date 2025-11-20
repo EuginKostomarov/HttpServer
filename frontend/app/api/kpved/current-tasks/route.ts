@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { getBackendUrl } from '@/lib/api-config'
 
-const BACKEND_URL = process.env.BACKEND_URL || 'http://127.0.0.1:9999'
+const BACKEND_URL = getBackendUrl()
 
 export async function GET(_request: NextRequest) {
   try {

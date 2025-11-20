@@ -4,6 +4,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Badge } from "@/components/ui/badge"
 import { RefreshCw } from "lucide-react"
 import { Button } from "@/components/ui/button"
+import { normalizePercentage } from "@/lib/locale"
 
 interface StatsPanelProps {
   stats: {
@@ -18,7 +19,7 @@ interface StatsPanelProps {
 
 export function StatsPanel({ stats, onRefresh, isLoading }: StatsPanelProps) {
   const totalItems = stats.totalItems || (stats.totalGroups + stats.mergedItems)
-  const mergeRate = totalItems > 0 ? ((stats.mergedItems / totalItems) * 100).toFixed(1) : '0'
+  const mergeRate = totalItems > 0 ? normalizePercentage((stats.mergedItems / totalItems) * 100).toFixed(1) : '0'
 
   return (
     <Card>
@@ -72,7 +73,7 @@ export function StatsPanel({ stats, onRefresh, isLoading }: StatsPanelProps) {
               {Object.entries(stats.categories)
                 .sort(([, a], [, b]) => b - a)
                 .map(([category, count]) => {
-                  const percentage = totalItems > 0 ? ((count / totalItems) * 100).toFixed(1) : '0'
+                  const percentage = totalItems > 0 ? normalizePercentage((count / totalItems) * 100).toFixed(1) : '0'
                   return (
                     <div key={category} className="flex justify-between items-center text-xs py-1">
                       <span className="text-muted-foreground truncate flex-1 mr-2">{category}:</span>

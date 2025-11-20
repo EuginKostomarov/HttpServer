@@ -6,6 +6,9 @@ const nextConfig: NextConfig = {
   
   // Настройки для работы в контейнере
   // outputFileTracingRoot: require('path').join(__dirname, '../../'),
+  
+  // Включаем строгий режим React для лучшей работы с DevTools
+  reactStrictMode: true,
 };
 
 export default nextConfig;

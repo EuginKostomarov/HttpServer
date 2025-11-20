@@ -1,0 +1,35 @@
+{
+  "models": [
+    {
+      "avg_response_time_ms": 2407,
+      "error_count": 4,
+      "max_response_time_ms": 8251,
+      "median_response_time_ms": 10,
+      "min_response_time_ms": 7,
+      "model": "GLM-4.5-Air",
+      "p95_response_time_ms": 12,
+      "priority": 1,
+      "speed": 0.41538195165344544,
+      "status": "✓ OK",
+      "success_count": 11,
+      "success_rate": 73.33333333333333,
+      "total_requests": 15
+    },
+    {
+      "avg_response_time_ms": 4541,
+      "error_count": 4,
+      "max_response_time_ms": 30011,
+      "median_response_time_ms": 10,
+      "min_response_time_ms": 8,
+      "model": "Gemma-3-27B-ArliAI-RPMax-v3",
+      "p95_response_time_ms": 12,
+      "priority": 2,
+      "speed": 0.22020713387675275,
+      "status": "✓ OK",
+      "success_count": 11,
+      "success_rate": 73.33333333333333,
+      "total_requests": 15
+    }
+  ],
+  "timestamp": "2025-11-20T18:33:57+03:00"
+}

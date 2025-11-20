@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { kpvedReclassifySchema, validateRequest, formatValidationError } from '@/lib/validation'
+import { getBackendUrl } from '@/lib/api-config'
 
-// Используем 127.0.0.1 вместо localhost для более надежного подключения
-const BACKEND_URL = process.env.BACKEND_URL || 'http://127.0.0.1:9999'
+const BACKEND_URL = getBackendUrl()
 
 // Увеличиваем максимальное время выполнения для длительных операций классификации
 // Это важно для Vercel и других платформ с ограничениями времени выполнения

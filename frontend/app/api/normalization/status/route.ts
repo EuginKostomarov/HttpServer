@@ -1,49 +1,32 @@
-import { NextRequest, NextResponse } from 'next/server'
+import { NextRequest, NextResponse } from 'next/server';
+import { getBackendUrl } from '@/lib/api-config';
 
-const API_BASE = process.env.BACKEND_URL || 'http://localhost:9999'
+const API_BASE_URL = getBackendUrl()
 
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-export async function GET(_request: NextRequest) {
+export async function GET(request: NextRequest) {
   try {
-    const response = await fetch(`${API_BASE}/api/normalization/status`, {
-      method: 'GET',
+    // Используем специальный эндпоинт для дашборда
+    const backendResponse = await fetch(`${API_BASE_URL}/api/dashboard/normalization-status`, {
+      cache: 'no-store',
       headers: {
         'Content-Type': 'application/json',
       },
-      // Таймаут обрабатывается через catch блок
-    })
-
-    if (!response.ok) {
-      // Если бэкенд недоступен, возвращаем дефолтный статус
-      if (response.status === 0 || response.status >= 500) {
-        return NextResponse.json({
-          isRunning: false,
-          progress: 0,
-          processed: 0,
-          total: 15973,
-          currentStep: 'Бэкенд недоступен',
-          logs: [],
-        })
-      }
+    });
+    
+    if (!backendResponse.ok) {
       return NextResponse.json(
-        { error: `Backend responded with ${response.status}` },
-        { status: response.status }
-      )
+        { error: 'Failed to fetch normalization status' },
+        { status: backendResponse.status }
+      );
     }
-
-    const data = await response.json()
-    return NextResponse.json(data)
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  } catch (_error) {
-    // Бэкенд недоступен - возвращаем дефолтный статус
-    return NextResponse.json({
-      isRunning: false,
-      progress: 0,
-      processed: 0,
-      total: 15973,
-      currentStep: 'Бэкенд недоступен',
-      logs: [],
-    })
+    
+    const data = await backendResponse.json();
+    return NextResponse.json(data);
+  } catch (error) {
+    console.error('Error fetching normalization status:', error);
+    return NextResponse.json(
+      { error: 'Internal server error' },
+      { status: 500 }
+    );
   }
 }
-

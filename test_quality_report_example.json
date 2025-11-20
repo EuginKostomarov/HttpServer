@@ -1,0 +1,81 @@
+{
+  "generated_at": "2025-11-20T19:16:16+03:00",
+  "database": "test.db",
+  "quality_score": 0.85,
+  "summary": {
+    "total_records": 1000,
+    "high_quality_records": 700,
+    "medium_quality_records": 250,
+    "low_quality_records": 50,
+    "unique_groups": 500,
+    "avg_confidence": 0.82,
+    "success_rate": 70,
+    "issues_count": 25,
+    "critical_issues": 5
+  },
+  "distribution": {
+    "quality_levels": [
+      {
+        "name": "Высокое",
+        "count": 700,
+        "percentage": 70
+      },
+      {
+        "name": "Среднее",
+        "count": 250,
+        "percentage": 25
+      },
+      {
+        "name": "Низкое",
+        "count": 50,
+        "percentage": 5
+      }
+    ],
+    "completed": 1000,
+    "in_progress": 0,
+    "requires_review": 0,
+    "failed": 0
+  },
+  "detailed": {
+    "duplicates": [
+      {
+        "confidence": 0.95,
+        "count": 5,
+        "duplicate_type": "exact",
+        "duplicate_type_name": "Точное совпадение",
+        "group_id": 1,
+        "group_name": "Группа 1",
+        "id": 1,
+        "item_count": 5,
+        "merged": false,
+        "reason": "Полное совпадение названий",
+        "similarity_score": 0.98,
+        "status": "pending"
+      }
+    ],
+    "violations": [
+      {
+        "category": "completeness",
+        "count": 1,
+        "description": "Отсутствует обязательное поле",
+        "id": 1,
+        "resolved": false,
+        "rule_name": "missing_field",
+        "severity": "medium",
+        "type": "missing_field"
+      }
+    ],
+    "completeness": [],
+    "consistency": []
+  },
+  "recommendations": [
+    {
+      "type": "improve_confidence",
+      "priority": "high",
+      "title": "Улучшить уверенность нормализации",
+      "description": "Рекомендуется добавить больше эталонных записей",
+      "action": "Добавить эталонные записи для категорий с низкой уверенностью",
+      "impact": 0.15
+    }
+  ]
+}

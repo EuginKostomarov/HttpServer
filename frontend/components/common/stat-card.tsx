@@ -71,18 +71,31 @@ export function StatCard({
   return (
     <Card
       className={cn(
-        'transition-all hover:shadow-md',
+        'transition-all hover:shadow-lg hover:scale-[1.02] relative overflow-hidden group',
         variantStyles[variant],
         onClick && 'cursor-pointer',
         className
       )}
       onClick={onClick}
     >
-      <CardHeader className="pb-3">
+      {/* Декоративный градиент */}
+      <div className={cn(
+        'absolute top-0 right-0 w-32 h-32 rounded-full blur-3xl opacity-10 group-hover:opacity-20 transition-opacity',
+        variant === 'primary' && 'bg-blue-500',
+        variant === 'success' && 'bg-green-500',
+        variant === 'warning' && 'bg-yellow-500',
+        variant === 'danger' && 'bg-red-500',
+        variant === 'default' && 'bg-primary'
+      )} />
+      
+      <CardHeader className="pb-3 relative z-10">
         <div className="flex items-center justify-between">
           <CardTitle className="text-sm font-medium">{title}</CardTitle>
           {Icon && (
-            <div className={cn('flex items-center justify-center', iconColors[variant])}>
+            <div className={cn(
+              'flex items-center justify-center p-2 rounded-lg bg-background/50 group-hover:scale-110 transition-transform',
+              iconColors[variant]
+            )}>
               {isValidElement(Icon) ? (
                 // Уже созданный React элемент
                 Icon
@@ -91,7 +104,7 @@ export function StatCard({
                 <>{Icon}</>
               ) : typeof Icon === 'function' ? (
                 // React компонент (например, LucideIcon из lucide-react)
-                <Icon className="h-4 w-4" />
+                <Icon className="h-5 w-5" />
               ) : (
                 // Остальные случаи (объекты, массивы и т.д.) - не рендерим напрямую
                 null
@@ -100,27 +113,34 @@ export function StatCard({
           )}
         </div>
       </CardHeader>
-      <CardContent>
-        <div className={cn('text-2xl font-bold', valueColors[variant])}>
+      <CardContent className="relative z-10">
+        <div className={cn('text-3xl font-bold mb-1', valueColors[variant])}>
           {formattedValue}
         </div>
         {description && (
-          <p className="text-xs text-muted-foreground mt-1">{description}</p>
+          <p className="text-xs text-muted-foreground mt-1.5">{description}</p>
         )}
         {progress !== undefined && (
-          <Progress value={progress} className="mt-2" />
+          <div className="mt-3">
+            <Progress value={progress} className="h-2" />
+            <div className="flex justify-between items-center mt-1.5">
+              <span className="text-xs text-muted-foreground">Прогресс</span>
+              <span className="text-xs font-medium">{progress.toFixed(0)}%</span>
+            </div>
+          </div>
         )}
         {trend && (
-          <div className="mt-2 flex items-center gap-1 text-xs">
+          <div className="mt-3 flex items-center gap-1.5 text-xs">
             <span
               className={cn(
-                'font-medium',
+                'font-semibold flex items-center gap-1',
                 trend.isPositive !== false
-                  ? 'text-green-600'
-                  : 'text-red-600'
+                  ? 'text-green-600 dark:text-green-400'
+                  : 'text-red-600 dark:text-red-400'
               )}
             >
-              {trend.isPositive !== false ? '↑' : '↓'} {trend.value}
+              <span className="text-base">{trend.isPositive !== false ? '↑' : '↓'}</span>
+              {trend.value}
             </span>
             <span className="text-muted-foreground">{trend.label}</span>
           </div>

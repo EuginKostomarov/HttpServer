@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"httpserver/database"
 	"httpserver/quality"
@@ -255,62 +256,9 @@ func (s *Server) handleQualitySuggestions(w http.ResponseWriter, r *http.Request
 
 	s.writeJSONResponse(w, response, http.StatusOK)
 }
+// handleQualityMetrics удален - не используется
 
-// handleQualityMetrics возвращает метрики качества для проекта
-func (s *Server) handleQualityMetrics(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	projectID, err := strconv.Atoi(r.URL.Query().Get("project_id"))
-	if err != nil {
-		s.writeJSONError(w, "Invalid project ID", http.StatusBadRequest)
-		return
-	}
-
-	period := r.URL.Query().Get("period")
-	if period == "" {
-		period = "month" // default period
-	}
-
-	metrics, err := s.serviceDB.GetQualityMetricsForProject(projectID, period)
-	if err != nil {
-		log.Printf("Error getting quality metrics: %v", err)
-		s.writeJSONError(w, "Failed to get quality metrics", http.StatusInternalServerError)
-		return
-	}
-
-	s.writeJSONResponse(w, metrics, http.StatusOK)
-}
-
-// handleCompareProjectsQuality сравнивает качество между проектами
-func (s *Server) handleCompareProjectsQuality(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var projectIDs []int
-	if err := json.NewDecoder(r.Body).Decode(&projectIDs); err != nil {
-		s.writeJSONError(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	if len(projectIDs) < 2 {
-		s.writeJSONError(w, "At least two project IDs required", http.StatusBadRequest)
-		return
-	}
-
-	comparison, err := s.serviceDB.CompareProjectsQuality(projectIDs)
-	if err != nil {
-		log.Printf("Error comparing projects quality: %v", err)
-		s.writeJSONError(w, "Failed to compare projects", http.StatusInternalServerError)
-		return
-	}
-
-	s.writeJSONResponse(w, comparison, http.StatusOK)
-}
+// handleCompareProjectsQuality удален - не используется (если нужен, можно восстановить)
 
 // handleQualitySuggestionAction обрабатывает действия с предложениями
 func (s *Server) handleQualitySuggestionAction(w http.ResponseWriter, r *http.Request) {
@@ -810,4 +758,410 @@ func (s *Server) handleQualityAnalyzeStatus(w http.ResponseWriter, r *http.Reque
 	s.qualityAnalysisMutex.RUnlock()
 
 	s.writeJSONResponse(w, status, http.StatusOK)
+}
+
+// handleGetQualityReport возвращает полный отчёт оценки качества базы данных
+func (s *Server) handleGetQualityReport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Получаем параметр database из query
+	databasePath := r.URL.Query().Get("database")
+	if databasePath == "" {
+		// Если не указан, используем normalizedDB по умолчанию
+		databasePath = s.currentNormalizedDBPath
+	}
+
+	// Генерируем отчёт
+	report, err := s.generateQualityReport(databasePath)
+	if err != nil {
+		log.Printf("Error generating quality report: %v", err)
+		s.writeJSONError(w, fmt.Sprintf("Failed to generate quality report: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	s.writeJSONResponse(w, report, http.StatusOK)
+}
+
+// NormalizationQualityReport представляет полный отчёт оценки качества нормализации
+type NormalizationQualityReport struct {
+	GeneratedAt    string                         `json:"generated_at"`
+	Database       string                         `json:"database"`
+	QualityScore   float64                        `json:"quality_score"`
+	Summary        *NormalizationQualitySummary   `json:"summary"`
+	Distribution   *QualityDistribution          `json:"distribution"`
+	Detailed       *DetailedAnalysis             `json:"detailed"`
+	Recommendations []QualityRecommendation       `json:"recommendations"`
+}
+
+// NormalizationQualitySummary представляет сводные метрики нормализации
+type NormalizationQualitySummary struct {
+	TotalRecords       int     `json:"total_records"`
+	HighQualityRecords int     `json:"high_quality_records"`
+	MediumQualityRecords int   `json:"medium_quality_records"`
+	LowQualityRecords  int     `json:"low_quality_records"`
+	UniqueGroups       int     `json:"unique_groups"`
+	AvgConfidence      float64 `json:"avg_confidence"`
+	SuccessRate        float64 `json:"success_rate"`
+	IssuesCount        int     `json:"issues_count"`
+	CriticalIssues     int     `json:"critical_issues"`
+}
+
+// QualityDistribution представляет распределение качества
+type QualityDistribution struct {
+	QualityLevels    []QualityLevel `json:"quality_levels"`
+	Completed         int            `json:"completed"`
+	InProgress        int            `json:"in_progress"`
+	RequiresReview    int            `json:"requires_review"`
+	Failed            int            `json:"failed"`
+}
+
+// QualityLevel представляет уровень качества
+type QualityLevel struct {
+	Name      string  `json:"name"`
+	Count     int     `json:"count"`
+	Percentage float64 `json:"percentage"`
+}
+
+// DetailedAnalysis представляет детальный анализ
+type DetailedAnalysis struct {
+	Duplicates   []interface{} `json:"duplicates"`
+	Violations   []interface{} `json:"violations"`
+	Completeness []interface{} `json:"completeness"`
+	Consistency  []interface{} `json:"consistency"`
+}
+
+// QualityRecommendation представляет рекомендацию по улучшению
+type QualityRecommendation struct {
+	Type        string `json:"type"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	Priority    string `json:"priority"`
+	Action      string `json:"action,omitempty"`
+}
+
+// generateQualityReport генерирует полный отчёт оценки качества
+func (s *Server) generateQualityReport(databasePath string) (*NormalizationQualityReport, error) {
+	// Открываем нужную БД
+	var db *database.DB
+	var err error
+	if databasePath != "" && databasePath != s.currentNormalizedDBPath {
+		db, err = database.NewDB(databasePath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open database: %w", err)
+		}
+		defer db.Close()
+	} else {
+		db = s.normalizedDB
+	}
+
+	report := &NormalizationQualityReport{
+		GeneratedAt: time.Now().Format(time.RFC3339),
+		Database:    databasePath,
+	}
+
+	// Получаем сводные метрики
+	summary, err := s.getQualitySummary(db)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get quality summary: %w", err)
+	}
+	report.Summary = summary
+
+	// Получаем распределение качества
+	distribution, err := s.getQualityDistribution(db)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get quality distribution: %w", err)
+	}
+	report.Distribution = distribution
+
+	// Получаем детальный анализ
+	detailed, err := s.getDetailedAnalysis(db)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get detailed analysis: %w", err)
+	}
+	report.Detailed = detailed
+
+	// Вычисляем общий quality_score
+	report.QualityScore = s.calculateOverallQualityScore(summary, distribution)
+
+	// Генерируем рекомендации
+	report.Recommendations = s.generateRecommendations(summary, distribution, detailed)
+
+	return report, nil
+}
+
+// getQualitySummary получает сводные метрики
+func (s *Server) getQualitySummary(db *database.DB) (*NormalizationQualitySummary, error) {
+	summary := &NormalizationQualitySummary{}
+
+	// Общее количество записей
+	err := db.GetDB().QueryRow("SELECT COUNT(*) FROM normalized_data").Scan(&summary.TotalRecords)
+	if err != nil {
+		return nil, err
+	}
+
+	// Записи по уровням качества
+	err = db.GetDB().QueryRow(`
+		SELECT 
+			SUM(CASE WHEN ai_confidence >= 0.8 OR processing_level = 'benchmark' THEN 1 ELSE 0 END) as high_quality,
+			SUM(CASE WHEN (ai_confidence >= 0.5 AND ai_confidence < 0.8) OR processing_level = 'ai_enhanced' THEN 1 ELSE 0 END) as medium_quality,
+			SUM(CASE WHEN ai_confidence < 0.5 OR processing_level = 'basic' THEN 1 ELSE 0 END) as low_quality,
+			COUNT(DISTINCT stage3_group_id) as unique_groups,
+			AVG(COALESCE(ai_confidence, CASE 
+				WHEN processing_level = 'benchmark' THEN 0.95
+				WHEN processing_level = 'ai_enhanced' THEN 0.85
+				WHEN processing_level = 'enhanced' THEN 0.70
+				ELSE 0.50
+			END)) as avg_confidence
+		FROM normalized_data
+	`).Scan(
+		&summary.HighQualityRecords,
+		&summary.MediumQualityRecords,
+		&summary.LowQualityRecords,
+		&summary.UniqueGroups,
+		&summary.AvgConfidence,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Процент успеха
+	if summary.TotalRecords > 0 {
+		summary.SuccessRate = float64(summary.HighQualityRecords) / float64(summary.TotalRecords) * 100
+	}
+
+	// Количество проблем (из violations)
+	violations, _, err := db.GetViolations(map[string]interface{}{}, 1000, 0)
+	if err == nil {
+		summary.IssuesCount = len(violations)
+		for _, v := range violations {
+			if v.Severity == "critical" || v.Severity == "high" {
+				summary.CriticalIssues++
+			}
+		}
+	}
+
+	return summary, nil
+}
+
+// getQualityDistribution получает распределение качества
+func (s *Server) getQualityDistribution(db *database.DB) (*QualityDistribution, error) {
+	distribution := &QualityDistribution{}
+
+	// Получаем распределение по уровням
+	rows, err := db.GetDB().Query(`
+		SELECT 
+			COALESCE(processing_level, 'basic') as level,
+			COUNT(*) as count
+		FROM normalized_data
+		GROUP BY COALESCE(processing_level, 'basic')
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var totalCount int
+	err = db.GetDB().QueryRow("SELECT COUNT(*) FROM normalized_data").Scan(&totalCount)
+	if err != nil {
+		return nil, err
+	}
+
+	levelNames := map[string]string{
+		"basic":        "Низкое",
+		"enhanced":     "Среднее",
+		"ai_enhanced":  "Высокое",
+		"benchmark":    "Эталонное",
+	}
+
+	for rows.Next() {
+		var level string
+		var count int
+		if err := rows.Scan(&level, &count); err != nil {
+			continue
+		}
+
+		levelName := levelNames[level]
+		if levelName == "" {
+			levelName = level
+		}
+
+		percentage := 0.0
+		if totalCount > 0 {
+			percentage = float64(count) / float64(totalCount) * 100
+		}
+
+		distribution.QualityLevels = append(distribution.QualityLevels, QualityLevel{
+			Name:      levelName,
+			Count:     count,
+			Percentage: percentage,
+		})
+	}
+
+	// Статус обработки (упрощённо)
+	distribution.Completed = totalCount
+	distribution.InProgress = 0
+	distribution.RequiresReview = 0
+	distribution.Failed = 0
+
+	return distribution, nil
+}
+
+// getDetailedAnalysis получает детальный анализ
+func (s *Server) getDetailedAnalysis(db *database.DB) (*DetailedAnalysis, error) {
+	detailed := &DetailedAnalysis{
+		Duplicates:   []interface{}{},
+		Violations:   []interface{}{},
+		Completeness: []interface{}{},
+		Consistency:  []interface{}{},
+	}
+
+	// Получаем дубликаты (топ-50)
+	duplicateGroups, _, err := db.GetDuplicateGroups(false, 50, 0)
+	if err == nil {
+		for _, group := range duplicateGroups {
+			duplicateTypeNames := map[string]string{
+				"exact":    "Точное совпадение",
+				"semantic": "Семантическое",
+				"phonetic": "Фонетическое",
+				"mixed":    "Смешанное",
+			}
+			duplicateTypeName := duplicateTypeNames[group.DuplicateType]
+			if duplicateTypeName == "" {
+				duplicateTypeName = group.DuplicateType
+			}
+
+			detailed.Duplicates = append(detailed.Duplicates, map[string]interface{}{
+				"id":              group.ID,
+				"group_id":        group.ID,
+				"group_name":      fmt.Sprintf("Группа %d", group.ID),
+				"count":           len(group.ItemIDs),
+				"item_count":      len(group.ItemIDs),
+				"confidence":      group.Confidence,
+				"similarity_score": group.SimilarityScore,
+				"duplicate_type":   group.DuplicateType,
+				"duplicate_type_name": duplicateTypeName,
+				"reason":          group.Reason,
+				"merged":          group.Merged,
+				"status":          map[bool]string{true: "resolved", false: "pending"}[group.Merged],
+			})
+		}
+	}
+
+	// Получаем нарушения (топ-50)
+	violations, _, err := db.GetViolations(map[string]interface{}{}, 50, 0)
+	if err == nil {
+		for _, v := range violations {
+			resolved := v.ResolvedAt != nil
+			detailed.Violations = append(detailed.Violations, map[string]interface{}{
+				"id":            v.ID,
+				"type":          v.RuleName,
+				"rule_name":     v.RuleName,
+				"category":      v.Category,
+				"severity":      v.Severity,
+				"description":   v.Description,
+				"message":       v.Description,
+				"recommendation": v.Recommendation,
+				"count":         1,
+				"resolved":      resolved,
+			})
+		}
+	}
+
+	// Получаем предложения (топ-50)
+	suggestions, _, err := db.GetSuggestions(map[string]interface{}{"applied": false}, 50, 0)
+	if err == nil {
+		for _, sug := range suggestions {
+			detailed.Completeness = append(detailed.Completeness, map[string]interface{}{
+				"id":              sug.ID,
+				"type":            sug.SuggestionType,
+				"priority":         sug.Priority,
+				"field":            sug.Field,
+				"field_name":       sug.Field,
+				"current_value":    sug.CurrentValue,
+				"suggested_value":  sug.SuggestedValue,
+				"confidence":       sug.Confidence,
+				"applied":          sug.Applied,
+			})
+		}
+	}
+
+	// Согласованность (пока пусто)
+	detailed.Consistency = []interface{}{}
+
+	return detailed, nil
+}
+
+// calculateOverallQualityScore вычисляет общий показатель качества
+func (s *Server) calculateOverallQualityScore(summary *NormalizationQualitySummary, distribution *QualityDistribution) float64 {
+	if summary.TotalRecords == 0 {
+		return 0.0
+	}
+
+	// Используем среднюю уверенность и процент успеха
+	score := summary.AvgConfidence * 0.7 + (summary.SuccessRate / 100.0) * 0.3
+
+	// Учитываем количество проблем (штраф)
+	if summary.IssuesCount > 0 {
+		penalty := float64(summary.IssuesCount) / float64(summary.TotalRecords) * 0.1
+		score = score - penalty
+		if score < 0 {
+			score = 0
+		}
+	}
+
+	return score
+}
+
+// generateRecommendations генерирует рекомендации по улучшению
+func (s *Server) generateRecommendations(summary *NormalizationQualitySummary, distribution *QualityDistribution, detailed *DetailedAnalysis) []QualityRecommendation {
+	recommendations := []QualityRecommendation{}
+
+	// Рекомендация по низкому качеству
+	if summary.LowQualityRecords > summary.TotalRecords/2 {
+		recommendations = append(recommendations, QualityRecommendation{
+			Type:        "quality_improvement",
+			Title:       "Улучшение качества данных",
+			Description: fmt.Sprintf("Более 50%% записей имеют низкое качество. Рекомендуется запустить нормализацию с AI-улучшением."),
+			Priority:    "high",
+			Action:      "Запустить нормализацию с AI-улучшением",
+		})
+	}
+
+	// Рекомендация по дубликатам
+	if len(detailed.Duplicates) > 10 {
+		recommendations = append(recommendations, QualityRecommendation{
+			Type:        "duplicates",
+			Title:       "Объединение дубликатов",
+			Description: fmt.Sprintf("Найдено %d групп дубликатов. Рекомендуется проверить и объединить дублирующиеся записи.", len(detailed.Duplicates)),
+			Priority:    "medium",
+			Action:      "Проверить и объединить дубликаты",
+		})
+	}
+
+	// Рекомендация по нарушениям
+	if summary.CriticalIssues > 0 {
+		recommendations = append(recommendations, QualityRecommendation{
+			Type:        "violations",
+			Title:       "Критические нарушения",
+			Description: fmt.Sprintf("Обнаружено %d критических нарушений правил качества. Требуется немедленное внимание.", summary.CriticalIssues),
+			Priority:    "high",
+			Action:      "Исправить критические нарушения",
+		})
+	}
+
+	// Рекомендация по предложениям
+	if len(detailed.Completeness) > 20 {
+		recommendations = append(recommendations, QualityRecommendation{
+			Type:        "suggestions",
+			Title:       "Применение предложений",
+			Description: fmt.Sprintf("Доступно %d предложений по улучшению данных. Рекомендуется применить автоматические исправления.", len(detailed.Completeness)),
+			Priority:    "medium",
+			Action:      "Применить предложения по улучшению",
+		})
+	}
+
+	return recommendations
 }

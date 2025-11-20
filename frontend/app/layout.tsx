@@ -5,6 +5,7 @@ import { ThemeProvider } from "@/components/providers/theme-provider";
 import { Header } from "@/components/layout/header";
 import { Footer } from "@/components/layout/footer";
 import { Toaster } from "sonner";
+import { ConsoleInterceptorProvider } from "@/components/console-interceptor-provider";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -16,18 +17,37 @@ const geistMono = Geist_Mono({
   subsets: ["latin"],
 });
 
-export const metadata: Metadata = {
-  title: "Нормализатор данных 1С",
-  description: "Управление процессом нормализации номенклатуры",
-};
+import { generateMetadata as genMeta, seoConfigs } from "@/lib/seo"
+
+export const metadata: Metadata = genMeta(seoConfigs.home)
 
 export default function RootLayout({
   children,
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  const structuredData = seoConfigs.home.structuredData || {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    name: "Нормализатор",
+    description: "Автоматизированная система для нормализации и унификации справочных данных",
+    applicationCategory: "BusinessApplication",
+    operatingSystem: "Web",
+    offers: {
+      "@type": "Offer",
+      price: "0",
+      priceCurrency: "RUB",
+    },
+  };
+
   return (
     <html lang="ru" suppressHydrationWarning>
+      <head>
+        <script
+          type="application/ld+json"
+          dangerouslySetInnerHTML={{ __html: JSON.stringify(structuredData) }}
+        />
+      </head>
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >
@@ -37,6 +57,7 @@ export default function RootLayout({
           enableSystem
           disableTransitionOnChange
         >
+          <ConsoleInterceptorProvider />
           <div className="relative flex min-h-screen flex-col">
             <Header />
             <main className="flex-1">{children}</main>

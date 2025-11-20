@@ -4,11 +4,13 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 )
 
-// MigrateNormalizedDataStageFields добавляет поля отслеживания всех 10 этапов в таблицу normalized_data
+// MigrateNormalizedDataStageFields добавляет поля отслеживания всех этапов в таблицу normalized_data
 // Это позволяет отслеживать прогресс обработки каждой записи через многоэтапный pipeline
+// Включает основные этапы (0.5-10) и этапы классификаторов (11-12)
 func MigrateNormalizedDataStageFields(db *sql.DB) error {
 	log.Println("Running migration: adding stage tracking fields to normalized_data...")
 
@@ -104,6 +106,20 @@ func MigrateNormalizedDataStageFields(db *sql.DB) error {
 		`ALTER TABLE normalized_data ADD COLUMN stage10_export_format TEXT`,
 		`ALTER TABLE normalized_data ADD COLUMN stage10_completed_at TIMESTAMP`,
 
+		// Этап 11: Классификация по КПВЭД
+		`ALTER TABLE normalized_data ADD COLUMN stage11_kpved_code TEXT`,
+		`ALTER TABLE normalized_data ADD COLUMN stage11_kpved_name TEXT`,
+		`ALTER TABLE normalized_data ADD COLUMN stage11_kpved_confidence REAL DEFAULT 0.0`,
+		`ALTER TABLE normalized_data ADD COLUMN stage11_kpved_completed INTEGER DEFAULT 0`,
+		`ALTER TABLE normalized_data ADD COLUMN stage11_kpved_completed_at TIMESTAMP`,
+
+		// Этап 12: Классификация по ОКПД2
+		`ALTER TABLE normalized_data ADD COLUMN stage12_okpd2_code TEXT`,
+		`ALTER TABLE normalized_data ADD COLUMN stage12_okpd2_name TEXT`,
+		`ALTER TABLE normalized_data ADD COLUMN stage12_okpd2_confidence REAL DEFAULT 0.0`,
+		`ALTER TABLE normalized_data ADD COLUMN stage12_okpd2_completed INTEGER DEFAULT 0`,
+		`ALTER TABLE normalized_data ADD COLUMN stage12_okpd2_completed_at TIMESTAMP`,
+
 		// Финальная "золотая" запись
 		`ALTER TABLE normalized_data ADD COLUMN final_code TEXT`,
 		`ALTER TABLE normalized_data ADD COLUMN final_name TEXT`,
@@ -161,6 +177,8 @@ func createStageIndexes(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_normalized_stage8_completed ON normalized_data(stage8_completed)`,
 		`CREATE INDEX IF NOT EXISTS idx_normalized_stage9_completed ON normalized_data(stage9_completed)`,
 		`CREATE INDEX IF NOT EXISTS idx_normalized_stage10_exported ON normalized_data(stage10_exported)`,
+		`CREATE INDEX IF NOT EXISTS idx_normalized_stage11_kpved_completed ON normalized_data(stage11_kpved_completed)`,
+		`CREATE INDEX IF NOT EXISTS idx_normalized_stage12_okpd2_completed ON normalized_data(stage12_okpd2_completed)`,
 		`CREATE INDEX IF NOT EXISTS idx_normalized_final_completed ON normalized_data(final_completed)`,
 
 		// Композитные индексы для аналитики
@@ -174,6 +192,10 @@ func createStageIndexes(db *sql.DB) error {
 
 		// Индекс для финального кода
 		`CREATE INDEX IF NOT EXISTS idx_normalized_final_code ON normalized_data(final_code)`,
+
+		// Индексы для классификаторов
+		`CREATE INDEX IF NOT EXISTS idx_normalized_stage11_kpved_code ON normalized_data(stage11_kpved_code)`,
+		`CREATE INDEX IF NOT EXISTS idx_normalized_stage12_okpd2_code ON normalized_data(stage12_okpd2_code)`,
 	}
 
 	successCount := 0
@@ -215,6 +237,8 @@ func GetStageProgress(db *DB) (map[string]interface{}, error) {
 			COALESCE(SUM(CASE WHEN stage8_completed = 1 THEN 1 ELSE 0 END), 0) as stage8_completed,
 			COALESCE(SUM(CASE WHEN stage9_completed = 1 THEN 1 ELSE 0 END), 0) as stage9_completed,
 			COALESCE(SUM(CASE WHEN stage10_exported = 1 THEN 1 ELSE 0 END), 0) as stage10_completed,
+			COALESCE(SUM(CASE WHEN stage11_kpved_completed = 1 THEN 1 ELSE 0 END), 0) as stage11_completed,
+			COALESCE(SUM(CASE WHEN stage12_okpd2_completed = 1 THEN 1 ELSE 0 END), 0) as stage12_completed,
 			COALESCE(SUM(CASE WHEN final_completed = 1 THEN 1 ELSE 0 END), 0) as final_completed,
 			COALESCE(SUM(CASE WHEN stage8_manual_review_required = 1 THEN 1 ELSE 0 END), 0) as manual_review_required,
 			COALESCE(AVG(CASE WHEN final_confidence > 0 THEN final_confidence ELSE NULL END), 0) as avg_confidence,
@@ -229,6 +253,7 @@ func GetStageProgress(db *DB) (map[string]interface{}, error) {
 	var (
 		totalRecords, stage05, stage1, stage2, stage25, stage3, stage35 int
 		stage4, stage5, stage6, stage65, stage7, stage8, stage9, stage10 int
+		stage11, stage12 int
 		finalCompleted, manualReview int
 		avgConfidence float64
 		aiProcessedCount, classifierUsedCount int
@@ -238,6 +263,7 @@ func GetStageProgress(db *DB) (map[string]interface{}, error) {
 	err := row.Scan(
 		&totalRecords, &stage05, &stage1, &stage2, &stage25, &stage3, &stage35,
 		&stage4, &stage5, &stage6, &stage65, &stage7, &stage8, &stage9, &stage10,
+		&stage11, &stage12,
 		&finalCompleted, &manualReview, &avgConfidence, &aiProcessedCount, &classifierUsedCount,
 		&lastUpdated,
 	)
@@ -265,6 +291,8 @@ func GetStageProgress(db *DB) (map[string]interface{}, error) {
 		{"8", "Финальная валидация", stage8},
 		{"9", "Валидация качества", stage9},
 		{"10", "Экспорт", stage10},
+		{"11", "Классификация КПВЭД", stage11},
+		{"12", "Классификация ОКПД2", stage12},
 	}
 
 	// Build stage_stats array
@@ -334,6 +362,8 @@ func GetStageProgress(db *DB) (map[string]interface{}, error) {
 			"stage_8":   stage8,
 			"stage_9":   stage9,
 			"stage_10":  stage10,
+			"stage_11":  stage11,
+			"stage_12":  stage12,
 		},
 		"final_completed":        finalCompleted,
 		"manual_review_required": manualReview,
@@ -341,4 +371,252 @@ func GetStageProgress(db *DB) (map[string]interface{}, error) {
 	}
 
 	return response, nil
+}
+
+// GetProjectPipelineStats получает статистику этапов обработки из БД проекта
+func GetProjectPipelineStats(dbPath string) (map[string]interface{}, error) {
+	// Открываем БД проекта
+	projectDB, err := NewDB(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open project database: %w", err)
+	}
+	defer projectDB.Close()
+
+	// Проверяем существование таблицы normalized_data
+	// Используем метод QueryRow через обертку DB
+	var tableExists int
+	err = projectDB.QueryRow(`
+		SELECT COUNT(*) FROM sqlite_master 
+		WHERE type='table' AND name='normalized_data'
+	`).Scan(&tableExists)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check table existence: %w", err)
+	}
+
+	if tableExists == 0 {
+		// Таблица не существует, возвращаем пустую статистику
+		return map[string]interface{}{
+			"total_records":     0,
+			"overall_progress":  0,
+			"stage_stats":       []interface{}{},
+			"quality_metrics":   map[string]interface{}{
+				"avg_final_confidence":    0.0,
+				"manual_review_required":  0,
+				"classifier_success":      0,
+				"ai_success":              0,
+				"fallback_used":           0,
+			},
+			"processing_duration": "N/A",
+			"last_updated":       "",
+		}, nil
+	}
+
+	// Используем существующую функцию GetStageProgress для получения статистики
+	stats, err := GetStageProgress(projectDB)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get stage progress: %w", err)
+	}
+
+	return stats, nil
+}
+
+// AggregatePipelineStats агрегирует статистику из нескольких БД
+func AggregatePipelineStats(statsList []map[string]interface{}) map[string]interface{} {
+	if len(statsList) == 0 {
+		return map[string]interface{}{
+			"total_records":     0,
+			"overall_progress":  0,
+			"stage_stats":       []interface{}{},
+			"quality_metrics":   map[string]interface{}{},
+			"processing_duration": "N/A",
+			"last_updated":     "",
+		}
+	}
+
+	if len(statsList) == 1 {
+		return statsList[0]
+	}
+
+	// Агрегируем данные из всех БД
+	totalRecords := 0
+	var allStageStats []map[string]interface{}
+	qualityMetrics := map[string]interface{}{
+		"avg_final_confidence":    0.0,
+		"manual_review_required":  0,
+		"classifier_success":      0,
+		"ai_success":              0,
+		"fallback_used":           0,
+	}
+	var lastUpdated string
+
+	// Создаем map для агрегации статистики по этапам
+	stageMap := make(map[string]map[string]interface{})
+
+	for _, stats := range statsList {
+		// Суммируем общее количество записей
+		if tr, ok := stats["total_records"].(int); ok {
+			totalRecords += tr
+		} else if tr, ok := stats["total_records"].(float64); ok {
+			totalRecords += int(tr)
+		}
+
+		// Агрегируем статистику по этапам
+		if stageStats, ok := stats["stage_stats"].([]interface{}); ok {
+			for _, stage := range stageStats {
+				if stageData, ok := stage.(map[string]interface{}); ok {
+					stageNum := ""
+					if sn, ok := stageData["stage_number"].(string); ok {
+						stageNum = sn
+					}
+
+					if stageNum != "" {
+						if _, exists := stageMap[stageNum]; !exists {
+							stageName := ""
+							if sn, ok := stageData["stage_name"].(string); ok {
+								stageName = sn
+							}
+							stageMap[stageNum] = map[string]interface{}{
+								"stage_number":  stageNum,
+								"stage_name":    stageName,
+								"completed":     0,
+								"total":         0,
+								"progress":      0.0,
+								"avg_confidence": 0.0,
+								"errors":        0,
+								"pending":       0,
+							}
+						}
+
+						// Суммируем значения
+						aggStage := stageMap[stageNum]
+						currCompleted := 0
+						if c, ok := aggStage["completed"].(int); ok {
+							currCompleted = c
+						}
+						if completed, ok := stageData["completed"].(int); ok {
+							aggStage["completed"] = currCompleted + completed
+						} else if completed, ok := stageData["completed"].(float64); ok {
+							aggStage["completed"] = currCompleted + int(completed)
+						}
+						
+						currTotal := 0
+						if t, ok := aggStage["total"].(int); ok {
+							currTotal = t
+						}
+						if total, ok := stageData["total"].(int); ok {
+							aggStage["total"] = currTotal + total
+						} else if total, ok := stageData["total"].(float64); ok {
+							aggStage["total"] = currTotal + int(total)
+						}
+						
+						currErrors := 0
+						if e, ok := aggStage["errors"].(int); ok {
+							currErrors = e
+						}
+						if errors, ok := stageData["errors"].(int); ok {
+							aggStage["errors"] = currErrors + errors
+						} else if errors, ok := stageData["errors"].(float64); ok {
+							aggStage["errors"] = currErrors + int(errors)
+						}
+					}
+				}
+			}
+		}
+
+		// Агрегируем метрики качества
+		if qm, ok := stats["quality_metrics"].(map[string]interface{}); ok {
+			currMRR := 0
+			if m, ok := qualityMetrics["manual_review_required"].(int); ok {
+				currMRR = m
+			}
+			if mrr, ok := qm["manual_review_required"].(int); ok {
+				qualityMetrics["manual_review_required"] = currMRR + mrr
+			} else if mrr, ok := qm["manual_review_required"].(float64); ok {
+				qualityMetrics["manual_review_required"] = currMRR + int(mrr)
+			}
+			
+			currCS := 0
+			if c, ok := qualityMetrics["classifier_success"].(int); ok {
+				currCS = c
+			}
+			if cs, ok := qm["classifier_success"].(int); ok {
+				qualityMetrics["classifier_success"] = currCS + cs
+			} else if cs, ok := qm["classifier_success"].(float64); ok {
+				qualityMetrics["classifier_success"] = currCS + int(cs)
+			}
+			
+			currAI := 0
+			if a, ok := qualityMetrics["ai_success"].(int); ok {
+				currAI = a
+			}
+			if ai, ok := qm["ai_success"].(int); ok {
+				qualityMetrics["ai_success"] = currAI + ai
+			} else if ai, ok := qm["ai_success"].(float64); ok {
+				qualityMetrics["ai_success"] = currAI + int(ai)
+			}
+			
+			currFU := 0
+			if f, ok := qualityMetrics["fallback_used"].(int); ok {
+				currFU = f
+			}
+			if fu, ok := qm["fallback_used"].(int); ok {
+				qualityMetrics["fallback_used"] = currFU + fu
+			} else if fu, ok := qm["fallback_used"].(float64); ok {
+				qualityMetrics["fallback_used"] = currFU + int(fu)
+			}
+		}
+
+		// Берем последнюю дату обновления
+		if lu, ok := stats["last_updated"].(string); ok && lu > lastUpdated {
+			lastUpdated = lu
+		}
+	}
+
+	// Преобразуем map этапов в массив и вычисляем прогресс
+	for _, stage := range stageMap {
+		total := 0
+		if t, ok := stage["total"].(int); ok {
+			total = t
+		}
+		completed := 0
+		if c, ok := stage["completed"].(int); ok {
+			completed = c
+		}
+
+		if total > 0 {
+			stage["progress"] = float64(completed) / float64(total) * 100
+		} else {
+			stage["progress"] = 0.0
+		}
+
+		allStageStats = append(allStageStats, stage)
+	}
+
+	// Сортируем этапы по номеру
+	sort.Slice(allStageStats, func(i, j int) bool {
+		numI, _ := allStageStats[i]["stage_number"].(string)
+		numJ, _ := allStageStats[j]["stage_number"].(string)
+		return numI < numJ
+	})
+
+	// Вычисляем общий прогресс (средний прогресс по всем этапам)
+	overallProgress := 0.0
+	if len(allStageStats) > 0 {
+		totalProgress := 0.0
+		for _, stage := range allStageStats {
+			if progress, ok := stage["progress"].(float64); ok {
+				totalProgress += progress
+			}
+		}
+		overallProgress = totalProgress / float64(len(allStageStats))
+	}
+
+	return map[string]interface{}{
+		"total_records":      totalRecords,
+		"overall_progress":   overallProgress,
+		"stage_stats":        allStageStats,
+		"quality_metrics":    qualityMetrics,
+		"processing_duration": "N/A",
+		"last_updated":       lastUpdated,
+	}
 }

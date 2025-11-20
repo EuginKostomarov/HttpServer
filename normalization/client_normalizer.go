@@ -33,6 +33,7 @@ type ClientNormalizer struct {
 	aiClient      *nomenclature.AIClient
 	basicNormalizer *Normalizer
 	events        chan<- string
+	sessionID     *int // ID сессии нормализации
 }
 
 // WorkerConfigManagerInterface интерфейс для получения конфигурации модели
@@ -178,6 +179,14 @@ func (c *ClientNormalizer) ProcessWithClientBenchmarks(items []*database.Catalog
 		result.TotalProcessed, result.TotalGroups, result.BenchmarkMatches))
 
 	return result, nil
+}
+
+// SetSessionID устанавливает ID сессии нормализации
+func (c *ClientNormalizer) SetSessionID(sessionID int) {
+	c.sessionID = &sessionID
+	if c.basicNormalizer != nil {
+		c.basicNormalizer.SetSessionID(sessionID)
+	}
 }
 
 // sendEvent отправляет событие в канал

@@ -15,7 +15,7 @@ type Config struct {
 	BatchSize       int
 	MaxRetries      int
 	RequestTimeout  time.Duration
-	RateLimitDelay  time.Duration
+	// RateLimitDelay удален - rate limiting теперь контролируется через rate limiter в AIClient
 }
 
 // DefaultConfig возвращает конфигурацию по умолчанию
@@ -34,7 +34,7 @@ func DefaultConfig() Config {
 		BatchSize:      50,
 		MaxRetries:      3,
 		RequestTimeout:  30 * time.Second,
-		RateLimitDelay:  500 * time.Millisecond,
+		// RateLimitDelay удален - rate limiting контролируется через rate limiter в AIClient
 	}
 }
 

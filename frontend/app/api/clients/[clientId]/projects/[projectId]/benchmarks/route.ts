@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
+import { getBackendUrl } from '@/lib/api-config'
 
-const API_BASE_URL = process.env.BACKEND_URL || 'http://localhost:9999'
+const API_BASE_URL = getBackendUrl()
 
 export async function GET(
   request: Request,
@@ -34,6 +35,11 @@ export async function GET(
     }
 
     const data = await response.json()
+    console.log('Benchmarks API response:', { 
+      status: response.status, 
+      dataKeys: Object.keys(data),
+      benchmarksCount: Array.isArray(data) ? data.length : (data.benchmarks?.length || 0)
+    })
     return NextResponse.json(data)
   } catch (error) {
     console.error('Error fetching benchmarks:', error)

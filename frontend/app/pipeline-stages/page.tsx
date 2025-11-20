@@ -7,8 +7,14 @@ import { Button } from '@/components/ui/button';
 import { PipelineOverview } from '@/components/pipeline/PipelineOverview';
 import { PipelineFunnelChart } from '@/components/pipeline/PipelineFunnelChart';
 import { Skeleton } from '@/components/ui/skeleton';
-import { RefreshCw, TrendingUp, Database } from 'lucide-react';
+import { RefreshCw, TrendingUp, Database, Layers } from 'lucide-react';
 import { Alert, AlertDescription } from '@/components/ui/alert';
+import { ErrorState } from '@/components/common/error-state';
+import { normalizePercentage } from '@/lib/locale';
+import { FadeIn } from '@/components/animations/fade-in';
+import { motion } from 'framer-motion';
+import { Breadcrumb } from '@/components/ui/breadcrumb';
+import { BreadcrumbList } from '@/components/seo/breadcrumb-list';
 
 interface PipelineStatsData {
   total_records: number;
@@ -73,9 +79,17 @@ export default function PipelineStagesPage() {
     return () => clearInterval(interval);
   }, []);
 
+  const breadcrumbItems = [
+    { label: 'Этапы обработки', href: '/pipeline-stages', icon: Layers },
+  ]
+
   if (loading) {
     return (
-      <div className="container mx-auto py-6 space-y-6">
+      <div className="container-wide mx-auto px-4 py-8 space-y-6">
+        <BreadcrumbList items={breadcrumbItems.map(item => ({ label: item.label, href: item.href || '#' }))} />
+        <div className="mb-4">
+          <Breadcrumb items={breadcrumbItems} />
+        </div>
         <div className="flex justify-between items-center">
           <div>
             <Skeleton className="h-8 w-64 mb-2" />
@@ -101,22 +115,20 @@ export default function PipelineStagesPage() {
 
   if (error) {
     return (
-      <div className="container mx-auto py-6">
-        <Alert variant="destructive">
-          <AlertDescription>
-            <div className="flex items-center justify-between">
-              <span>{error}</span>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={fetchPipelineStats}
-              >
-                <RefreshCw className="h-4 w-4 mr-2" />
-                Повторить
-              </Button>
-            </div>
-          </AlertDescription>
-        </Alert>
+      <div className="container-wide mx-auto px-4 py-8">
+        <BreadcrumbList items={breadcrumbItems.map(item => ({ label: item.label, href: item.href || '#' }))} />
+        <div className="mb-4">
+          <Breadcrumb items={breadcrumbItems} />
+        </div>
+        <ErrorState
+          title="Ошибка загрузки статистики"
+          message={error}
+          action={{
+            label: 'Повторить',
+            onClick: fetchPipelineStats,
+          }}
+          variant="destructive"
+        />
       </div>
     );
   }
@@ -126,28 +138,54 @@ export default function PipelineStagesPage() {
   }
 
   return (
-    <div className="container mx-auto py-6 space-y-6">
-      {/* Заголовок */}
-      <div className="flex justify-between items-center">
-        <div>
-          <h1 className="text-3xl font-bold tracking-tight flex items-center gap-2">
-            <Database className="h-8 w-8" />
-            Детализация этапов обработки
-          </h1>
-          <p className="text-muted-foreground mt-1">
-            Прогресс по всем 15 этапам нормализации данных •
-            Обновлено: {new Date(pipelineStats.last_updated).toLocaleTimeString()}
-          </p>
-        </div>
-        <Button
-          variant="outline"
-          size="icon"
-          onClick={fetchPipelineStats}
-          disabled={refreshing}
-        >
-          <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
-        </Button>
+    <div className="container-wide mx-auto px-4 py-8 space-y-6">
+      <BreadcrumbList items={breadcrumbItems.map(item => ({ label: item.label, href: item.href || '#' }))} />
+      <div className="mb-4">
+        <Breadcrumb items={breadcrumbItems} />
       </div>
+
+      {/* Заголовок */}
+      <FadeIn>
+        <div className="flex justify-between items-center flex-wrap gap-4">
+          <div>
+            <motion.h1 
+              className="text-3xl font-bold tracking-tight flex items-center gap-2"
+              initial={{ opacity: 0, y: -20 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.5 }}
+            >
+              <div className="p-2 rounded-lg bg-primary/10">
+                <Layers className="h-6 w-6 text-primary" />
+              </div>
+              Детализация этапов обработки
+            </motion.h1>
+            <motion.p 
+              className="text-muted-foreground mt-2"
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.5, delay: 0.1 }}
+            >
+              Прогресс по всем 15 этапам нормализации данных •
+              Обновлено: {new Date(pipelineStats.last_updated).toLocaleTimeString('ru-RU')}
+            </motion.p>
+          </div>
+          <motion.div
+            initial={{ opacity: 0, scale: 0.9 }}
+            animate={{ opacity: 1, scale: 1 }}
+            transition={{ duration: 0.3, delay: 0.2 }}
+          >
+            <Button
+              variant="outline"
+              size="icon"
+              onClick={fetchPipelineStats}
+              disabled={refreshing}
+              className="gap-2"
+            >
+              <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
+            </Button>
+          </motion.div>
+        </div>
+      </FadeIn>
 
       {/* Tabs */}
       <Tabs defaultValue="overview" className="space-y-4">
@@ -251,7 +289,7 @@ export default function PipelineStagesPage() {
                     {pipelineStats.quality_metrics.avg_final_confidence < 0.8 && (
                       <Alert>
                         <AlertDescription>
-                          Средняя уверенность классификации ({(pipelineStats.quality_metrics.avg_final_confidence * 100).toFixed(1)}%) ниже рекомендуемого уровня 80%.
+                          Средняя уверенность классификации ({normalizePercentage(pipelineStats.quality_metrics.avg_final_confidence).toFixed(1)}%) ниже рекомендуемого уровня 80%.
                           Проверьте качество данных КПВЭД и настройки классификатора.
                         </AlertDescription>
                       </Alert>

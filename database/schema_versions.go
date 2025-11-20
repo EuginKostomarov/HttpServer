@@ -108,10 +108,25 @@ func CreateClassificationTables(db *sql.DB) error {
 		)
 	`
 
+	// Таблица связи типов проектов с классификаторами
+	projectTypeClassifiersTable := `
+		CREATE TABLE IF NOT EXISTS project_type_classifiers (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			project_type TEXT NOT NULL,
+			classifier_id INTEGER NOT NULL,
+			is_default BOOLEAN DEFAULT FALSE,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY(classifier_id) REFERENCES category_classifiers(id) ON DELETE CASCADE,
+			UNIQUE(project_type, classifier_id)
+		)
+	`
+
 	// Создаем таблицы
 	tables := []string{
 		classifiersTable,
 		strategiesTable,
+		projectTypeClassifiersTable,
 	}
 
 	for _, tableSQL := range tables {
@@ -128,6 +143,9 @@ func CreateClassificationTables(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_classifiers_project_id ON category_classifiers(project_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_strategies_client_id ON folding_strategies(client_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_strategies_default ON folding_strategies(is_default)`,
+		`CREATE INDEX IF NOT EXISTS idx_project_type_classifiers_project_type ON project_type_classifiers(project_type)`,
+		`CREATE INDEX IF NOT EXISTS idx_project_type_classifiers_classifier_id ON project_type_classifiers(classifier_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_project_type_classifiers_default ON project_type_classifiers(is_default)`,
 	}
 
 	for _, indexSQL := range indexes {
@@ -153,40 +171,55 @@ func CreateClassificationTables(db *sql.DB) error {
 		}
 	}
 
-	// Расширяем таблицу catalog_items полями категорий
-	migrations := []string{
-		`ALTER TABLE catalog_items ADD COLUMN category_original TEXT`,
-		`ALTER TABLE catalog_items ADD COLUMN category_level1 TEXT`,
-		`ALTER TABLE catalog_items ADD COLUMN category_level2 TEXT`,
-		`ALTER TABLE catalog_items ADD COLUMN category_level3 TEXT`,
-		`ALTER TABLE catalog_items ADD COLUMN category_level4 TEXT`,
-		`ALTER TABLE catalog_items ADD COLUMN category_level5 TEXT`,
-		`ALTER TABLE catalog_items ADD COLUMN classification_confidence REAL DEFAULT 0.0`,
-		`ALTER TABLE catalog_items ADD COLUMN classification_strategy TEXT`,
+	// Проверяем существование таблицы catalog_items перед миграцией
+	var tableExists bool
+	err := db.QueryRow(`
+		SELECT EXISTS (
+			SELECT 1 FROM sqlite_master
+			WHERE type='table' AND name='catalog_items'
+		)
+	`).Scan(&tableExists)
+	if err != nil {
+		// Если не удалось проверить, продолжаем (возможно, это не критично)
+		tableExists = false
 	}
 
-	for _, migration := range migrations {
-		_, err := db.Exec(migration)
-		if err != nil {
-			errStr := strings.ToLower(err.Error())
-			if !strings.Contains(errStr, "duplicate column") &&
-				!strings.Contains(errStr, "already exists") {
-				return fmt.Errorf("failed to migrate catalog_items for classification: %w", err)
+	// Расширяем таблицу catalog_items полями категорий только если она существует
+	if tableExists {
+		migrations := []string{
+			`ALTER TABLE catalog_items ADD COLUMN category_original TEXT`,
+			`ALTER TABLE catalog_items ADD COLUMN category_level1 TEXT`,
+			`ALTER TABLE catalog_items ADD COLUMN category_level2 TEXT`,
+			`ALTER TABLE catalog_items ADD COLUMN category_level3 TEXT`,
+			`ALTER TABLE catalog_items ADD COLUMN category_level4 TEXT`,
+			`ALTER TABLE catalog_items ADD COLUMN category_level5 TEXT`,
+			`ALTER TABLE catalog_items ADD COLUMN classification_confidence REAL DEFAULT 0.0`,
+			`ALTER TABLE catalog_items ADD COLUMN classification_strategy TEXT`,
+		}
+
+		for _, migration := range migrations {
+			_, err := db.Exec(migration)
+			if err != nil {
+				errStr := strings.ToLower(err.Error())
+				if !strings.Contains(errStr, "duplicate column") &&
+					!strings.Contains(errStr, "already exists") {
+					return fmt.Errorf("failed to migrate catalog_items for classification: %w", err)
+				}
 			}
 		}
-	}
 
-	// Создаем индексы для категорий в catalog_items
-	categoryIndexes := []string{
-		`CREATE INDEX IF NOT EXISTS idx_catalog_items_category_level1 ON catalog_items(category_level1)`,
-		`CREATE INDEX IF NOT EXISTS idx_catalog_items_category_level2 ON catalog_items(category_level2)`,
-		`CREATE INDEX IF NOT EXISTS idx_catalog_items_classification_strategy ON catalog_items(classification_strategy)`,
-	}
+		// Создаем индексы для категорий в catalog_items
+		categoryIndexes := []string{
+			`CREATE INDEX IF NOT EXISTS idx_catalog_items_category_level1 ON catalog_items(category_level1)`,
+			`CREATE INDEX IF NOT EXISTS idx_catalog_items_category_level2 ON catalog_items(category_level2)`,
+			`CREATE INDEX IF NOT EXISTS idx_catalog_items_classification_strategy ON catalog_items(classification_strategy)`,
+		}
 
-	for _, indexSQL := range categoryIndexes {
-		_, err := db.Exec(indexSQL)
-		if err != nil {
-			return fmt.Errorf("failed to create catalog_items category index: %w", err)
+		for _, indexSQL := range categoryIndexes {
+			_, err := db.Exec(indexSQL)
+			if err != nil {
+				return fmt.Errorf("failed to create catalog_items category index: %w", err)
+			}
 		}
 	}
 

@@ -4,6 +4,7 @@ import * as React from 'react'
 import { Loader2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Card, CardContent } from '@/components/ui/card'
+import { motion } from 'framer-motion'
 
 export interface LoadingStateProps {
   message?: string
@@ -27,11 +28,24 @@ export function LoadingState({
   }
 
   const spinner = (
-    <Loader2 className={cn('animate-spin text-primary', sizeClasses[size])} />
+    <motion.div
+      initial={{ opacity: 0, scale: 0.8 }}
+      animate={{ opacity: 1, scale: 1 }}
+      transition={{ duration: 0.3 }}
+    >
+      <Loader2 className={cn('animate-spin text-primary', sizeClasses[size])} />
+    </motion.div>
   )
 
   const text = message && (
-    <p className="text-sm text-muted-foreground">{message}</p>
+    <motion.p 
+      className="text-sm text-muted-foreground"
+      initial={{ opacity: 0, y: 10 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.3, delay: 0.1 }}
+    >
+      {message}
+    </motion.p>
   )
 
   let content: React.ReactNode

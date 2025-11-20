@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
+import { normalizePercentage } from '@/lib/locale'
 import { Badge } from '@/components/ui/badge'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { AlertCircle, CheckCircle, GitMerge, Star, TrendingUp } from 'lucide-react'
@@ -217,8 +218,10 @@ export function QualityDuplicatesTab({ database }: { database: string }) {
     )
   }
 
+  const normalizeQuality = normalizePercentage
+
   const getQualityBadge = (score: number) => {
-    const percentage = Math.round(score * 100)
+    const percentage = Math.round(normalizeQuality(score))
     let variant: 'default' | 'destructive' | 'outline' = 'outline'
 
     if (percentage >= 90) variant = 'default'

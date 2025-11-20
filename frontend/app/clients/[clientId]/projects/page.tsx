@@ -16,6 +16,10 @@ import {
 } from "lucide-react"
 import { LoadingState } from "@/components/common/loading-state"
 import { EmptyState } from "@/components/common/empty-state"
+import { ErrorState } from "@/components/common/error-state"
+import { Alert, AlertDescription } from "@/components/ui/alert"
+import { AlertCircle } from "lucide-react"
+import { formatDate } from '@/lib/locale'
 
 interface Project {
   id: number
@@ -32,6 +36,7 @@ export default function ClientProjectsPage() {
   const clientId = params.clientId
   const [projects, setProjects] = useState<Project[]>([])
   const [isLoading, setIsLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
     if (clientId) {
@@ -41,13 +46,19 @@ export default function ClientProjectsPage() {
 
   const fetchProjects = async (id: string) => {
     setIsLoading(true)
+    setError(null)
     try {
       const response = await fetch(`/api/clients/${id}/projects`)
-      if (!response.ok) throw new Error('Failed to fetch projects')
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => 'Failed to fetch projects')
+        throw new Error(errorText || 'Не удалось загрузить проекты')
+      }
       const data = await response.json()
-      setProjects(data)
+      setProjects(data || [])
     } catch (error) {
       console.error('Failed to fetch projects:', error)
+      setError(error instanceof Error ? error.message : 'Не удалось загрузить проекты')
+      setProjects([])
     } finally {
       setIsLoading(false)
     }
@@ -57,6 +68,7 @@ export default function ClientProjectsPage() {
     const labels: Record<string, string> = {
       nomenclature: 'Номенклатура',
       counterparties: 'Контрагенты',
+      nomenclature_counterparties: 'Номенклатура + Контрагенты',
       mixed: 'Смешанный'
     }
     return labels[type] || type
@@ -83,6 +95,23 @@ export default function ClientProjectsPage() {
           </Link>
         </Button>
       </div>
+
+      {error && (
+        <Alert variant="destructive">
+          <AlertCircle className="h-4 w-4" />
+          <AlertDescription>
+            {error}
+            <Button
+              variant="outline"
+              size="sm"
+              className="ml-4"
+              onClick={() => clientId && fetchProjects(clientId as string)}
+            >
+              Повторить
+            </Button>
+          </AlertDescription>
+        </Alert>
+      )}
 
       {isLoading ? (
         <LoadingState message="Загрузка проектов..." size="lg" fullScreen />
@@ -112,7 +141,7 @@ export default function ClientProjectsPage() {
                 </div>
                 <div className="flex justify-between text-sm text-muted-foreground">
                   <span>Создан:</span>
-                  <span>{new Date(project.created_at).toLocaleDateString('ru-RU')}</span>
+                  <span>{formatDate(project.created_at)}</span>
                 </div>
                 <div className="flex gap-2 pt-2">
                   <Button asChild variant="outline" className="flex-1">
