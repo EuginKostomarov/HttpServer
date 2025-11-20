@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo, useCallback } from 'react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Activity, Zap, Database, Clock, TrendingUp, CheckCircle, XCircle, Radio, Wifi } from 'lucide-react'
@@ -14,6 +14,7 @@ import { Button } from '@/components/ui/button'
 import Link from 'next/link'
 import { BarChart3 } from 'lucide-react'
 import { useMonitoringSSE } from '@/hooks/useMonitoringSSE'
+import { formatNumber as formatLocaleNumber, normalizePercentage } from '@/lib/locale'
 
 interface AIMetrics {
   total_requests: number
@@ -129,25 +130,25 @@ export default function MonitoringPage() {
     }
   }, [liveMode, sseError, sseConnected])
 
-  const formatUptime = (seconds: number) => {
+  const formatUptime = useCallback((seconds: number) => {
     const hours = Math.floor(seconds / 3600)
     const minutes = Math.floor((seconds % 3600) / 60)
     const secs = Math.floor(seconds % 60)
     return `${hours}ч ${minutes}м ${secs}с`
-  }
+  }, [])
 
-  const formatNumber = (num: number) => {
+  const formatNumber = useCallback((num: number) => {
     if (num >= 1000000) {
       return `${(num / 1000000).toFixed(2)}M`
     } else if (num >= 1000) {
       return `${(num / 1000).toFixed(2)}K`
     }
     return num.toString()
-  }
+  }, [])
 
   if (loading) {
     return (
-      <div className="container mx-auto p-6">
+      <div className="container-wide mx-auto p-6">
         <LoadingState message="Загрузка метрик..." size="lg" fullScreen />
       </div>
     )
@@ -155,7 +156,7 @@ export default function MonitoringPage() {
 
   if (error || !metrics) {
     return (
-      <div className="container mx-auto p-6">
+      <div className="container-wide mx-auto p-6">
         <ErrorState
           title="Ошибка загрузки метрик"
           message={error || 'Метрики недоступны'}
@@ -170,7 +171,7 @@ export default function MonitoringPage() {
   }
 
   return (
-    <div className="container mx-auto p-6 space-y-6">
+    <div className="container-wide mx-auto p-6 space-y-6">
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-3xl font-bold">Мониторинг производительности</h1>
@@ -383,7 +384,7 @@ export default function MonitoringPage() {
               <p className="text-3xl font-bold text-gray-600">{formatNumber(metrics.quality.basic)}</p>
               <p className="text-xs text-muted-foreground">
                 {metrics.quality.total_normalized > 0
-                  ? ((metrics.quality.basic / metrics.quality.total_normalized) * 100).toFixed(1)
+                  ? normalizePercentage((metrics.quality.basic / metrics.quality.total_normalized) * 100).toFixed(1)
                   : 0}%
               </p>
             </div>
@@ -393,7 +394,7 @@ export default function MonitoringPage() {
               <p className="text-3xl font-bold text-blue-600">{formatNumber(metrics.quality.ai_enhanced)}</p>
               <p className="text-xs text-muted-foreground">
                 {metrics.quality.total_normalized > 0
-                  ? ((metrics.quality.ai_enhanced / metrics.quality.total_normalized) * 100).toFixed(1)
+                  ? normalizePercentage((metrics.quality.ai_enhanced / metrics.quality.total_normalized) * 100).toFixed(1)
                   : 0}%
               </p>
             </div>
@@ -403,7 +404,7 @@ export default function MonitoringPage() {
               <p className="text-3xl font-bold text-green-600">{formatNumber(metrics.quality.benchmark)}</p>
               <p className="text-xs text-muted-foreground">
                 {metrics.quality.total_normalized > 0
-                  ? ((metrics.quality.benchmark / metrics.quality.total_normalized) * 100).toFixed(1)
+                  ? normalizePercentage((metrics.quality.benchmark / metrics.quality.total_normalized) * 100).toFixed(1)
                   : 0}%
               </p>
             </div>

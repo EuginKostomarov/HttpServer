@@ -64,24 +64,33 @@ export function useMonitoringSSE(enabled: boolean = true) {
         }
 
         eventSource.onerror = (err) => {
-          console.error('[SSE] Connection error:', err)
-          setConnected(false)
-          eventSource.close()
-          eventSourceRef.current = null
+          // Проверяем состояние соединения перед логированием ошибки
+          if (eventSource.readyState === EventSource.CLOSED) {
+            // Соединение закрыто - это нормально при переподключении
+            setConnected(false)
+            eventSource.close()
+            eventSourceRef.current = null
 
-          // Reconnect with exponential backoff
-          reconnectAttemptsRef.current += 1
-          const delay = Math.min(1000 * Math.pow(2, reconnectAttemptsRef.current), 30000)
+            // Reconnect with exponential backoff
+            reconnectAttemptsRef.current += 1
+            const delay = Math.min(1000 * Math.pow(2, reconnectAttemptsRef.current), 30000)
 
-          if (reconnectAttemptsRef.current <= 5) {
-            console.log(`[SSE] Reconnecting in ${delay}ms (attempt ${reconnectAttemptsRef.current})`)
-            setError(`Connection lost. Reconnecting in ${(delay / 1000).toFixed(0)}s...`)
+            if (reconnectAttemptsRef.current <= 5) {
+              console.log(`[SSE] Reconnecting in ${delay}ms (attempt ${reconnectAttemptsRef.current})`)
+              setError(`Connection lost. Reconnecting in ${(delay / 1000).toFixed(0)}s...`)
 
-            reconnectTimeoutRef.current = setTimeout(() => {
-              connect()
-            }, delay)
+              reconnectTimeoutRef.current = setTimeout(() => {
+                connect()
+              }, delay)
+            } else {
+              setError('Connection failed after multiple attempts')
+              console.error('[SSE] Connection failed after multiple attempts')
+            }
           } else {
-            setError('Connection failed after multiple attempts')
+            // Другие ошибки - логируем только если это не обычное переподключение
+            if (eventSource.readyState !== EventSource.CONNECTING) {
+              console.error('[SSE] Connection error:', err)
+            }
           }
         }
       } catch (err) {

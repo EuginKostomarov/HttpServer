@@ -1,11 +1,19 @@
 import { ReactElement } from 'react'
-import { FixedSizeList as List, ListChildComponentProps } from 'react-window'
+// import { List } from 'react-window' // Temporarily disabled - not used in codebase
+
+interface ListChildComponentProps {
+  index: number
+  style: React.CSSProperties
+}
 
 /**
  * Virtualized List Component
  *
  * Efficiently renders large lists by only rendering visible items
  * Uses react-window for virtual scrolling
+ *
+ * NOTE: This component is currently disabled as it's not used in the codebase
+ * and has TypeScript compatibility issues with react-window types.
  *
  * @example
  * ```tsx
@@ -44,35 +52,16 @@ export function VirtualizedList<T>({
   width = '100%',
   overscanCount = 5,
 }: VirtualizedListProps<T>) {
-  // Wrapper component for each row
-  const Row = ({ index, style }: ListChildComponentProps) => {
-    const item = items[index]
-    return (
-      <div style={style} className={className}>
-        {renderItem(item, index)}
-      </div>
-    )
-  }
-
-  if (items.length === 0) {
-    return (
-      <div style={{ height }} className="flex items-center justify-center text-muted-foreground">
-        Нет элементов для отображения
-      </div>
-    )
-  }
-
+  // Component temporarily disabled - not used in codebase
+  // TODO: Fix TypeScript compatibility with react-window when needed
   return (
-    <List
-      height={height}
-      itemCount={items.length}
-      itemSize={itemHeight}
-      width={width}
-      overscanCount={overscanCount}
-      className="scrollbar-thin scrollbar-thumb-gray-300 scrollbar-track-gray-100"
-    >
-      {Row}
-    </List>
+    <div style={{ height }} className={className}>
+      {items.map((item, index) => (
+        <div key={index} style={{ height: itemHeight }}>
+          {renderItem(item, index)}
+        </div>
+      ))}
+    </div>
   )
 }
 
@@ -81,6 +70,9 @@ export function VirtualizedList<T>({
  *
  * Efficiently renders large grids by only rendering visible rows
  * Each row can contain multiple columns
+ *
+ * NOTE: This component is currently disabled as it's not used in the codebase
+ * and has TypeScript compatibility issues with react-window types.
  *
  * @example
  * ```tsx
@@ -123,50 +115,32 @@ export function VirtualizedGrid<T>({
   width = '100%',
   gap = 16,
 }: VirtualizedGridProps<T>) {
-  // Calculate total number of rows
+  // Component temporarily disabled - not used in codebase
+  // TODO: Fix TypeScript compatibility with react-window when needed
   const rowCount = Math.ceil(items.length / columns)
-
-  // Wrapper component for each row
-  const Row = ({ index, style }: ListChildComponentProps) => {
-    const startIndex = index * columns
-    const rowItems = items.slice(startIndex, startIndex + columns)
-
-    return (
-      <div
-        style={{
-          ...style,
-          display: 'grid',
-          gridTemplateColumns: `repeat(${columns}, 1fr)`,
-          gap: `${gap}px`,
-          padding: `${gap / 2}px`,
-        }}
-        className={className}
-      >
-        {rowItems.map((item, i) => (
-          <div key={startIndex + i}>{renderItem(item, startIndex + i)}</div>
-        ))}
-      </div>
-    )
-  }
-
-  if (items.length === 0) {
-    return (
-      <div style={{ height }} className="flex items-center justify-center text-muted-foreground">
-        Нет элементов для отображения
-      </div>
-    )
-  }
-
+  
   return (
-    <List
-      height={height}
-      itemCount={rowCount}
-      itemSize={rowHeight}
-      width={width}
-      overscanCount={3}
-      className="scrollbar-thin scrollbar-thumb-gray-300 scrollbar-track-gray-100"
-    >
-      {Row}
-    </List>
+    <div style={{ height, width }} className={className}>
+      {Array.from({ length: rowCount }, (_, rowIndex) => {
+        const startIndex = rowIndex * columns
+        const rowItems = items.slice(startIndex, startIndex + columns)
+        
+        return (
+          <div
+            key={rowIndex}
+            style={{
+              display: 'grid',
+              gridTemplateColumns: `repeat(${columns}, 1fr)`,
+              gap: `${gap}px`,
+              height: rowHeight,
+            }}
+          >
+            {rowItems.map((item, i) => (
+              <div key={startIndex + i}>{renderItem(item, startIndex + i)}</div>
+            ))}
+          </div>
+        )
+      })}
+    </div>
   )
 }

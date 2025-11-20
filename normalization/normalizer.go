@@ -54,6 +54,8 @@ type Normalizer struct {
 	enableCheckpoints bool
 	checkpointDir     string
 	currentCheckpoint *NormalizationCheckpoint // Текущий checkpoint для мониторинга
+	// Сессия нормализации
+	sessionID *int // ID сессии нормализации для связи с project_database
 }
 
 // groupKey ключ для группировки записей
@@ -406,7 +408,7 @@ func (n *Normalizer) ProcessNormalization() error {
 
 				// АТОМАРНАЯ вставка: items + attributes в ОДНОЙ транзакции
 				// Если любая часть упадет - откатится ВСЕ (предотвращает частичную вставку)
-				_, err = n.db.InsertNormalizedItemsWithAttributesBatch(filteredBatch, batchAttributes)
+				_, err = n.db.InsertNormalizedItemsWithAttributesBatch(filteredBatch, batchAttributes, n.sessionID)
 				if err != nil {
 					n.sendEvent(fmt.Sprintf("Ошибка вставки пакета: %v", err))
 					return fmt.Errorf("failed to insert batch: %w", err)
@@ -470,7 +472,7 @@ func (n *Normalizer) ProcessNormalization() error {
 		}
 
 		// АТОМАРНАЯ вставка: items + attributes в ОДНОЙ транзакции
-		_, err = n.db.InsertNormalizedItemsWithAttributesBatch(filteredBatch, batchAttributes)
+		_, err = n.db.InsertNormalizedItemsWithAttributesBatch(filteredBatch, batchAttributes, n.sessionID)
 		if err != nil {
 			n.sendEvent(fmt.Sprintf("Ошибка вставки финального пакета: %v", err))
 			return fmt.Errorf("failed to insert final batch: %w", err)
@@ -542,10 +544,8 @@ func (n *Normalizer) processWithAI(name string) (*AIResult, error) {
 	}
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		if attempt > 0 {
-			// Задержка перед повторной попыткой
-			time.Sleep(n.aiConfig.RateLimitDelay)
-		}
+		// Rate limiter в AIClient уже контролирует частоту запросов
+		// Дополнительная задержка не нужна - rate limiter сам будет ждать
 
 		result, err := n.aiNormalizer.NormalizeWithAI(name)
 		if err == nil {
@@ -852,5 +852,10 @@ func (n *Normalizer) GetCheckpointStatus() map[string]interface{} {
 		"last_checkpoint_time": lastCheckpointTime,
 		"current_batch_id":    currentBatchID,
 	}
+}
+
+// SetSessionID устанавливает ID сессии нормализации
+func (n *Normalizer) SetSessionID(sessionID int) {
+	n.sessionID = &sessionID
 }
 

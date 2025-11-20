@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
+import { getBackendUrl } from '@/lib/api-config'
 
-const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:9999'
+const BACKEND_URL = getBackendUrl()
 const SERVICE_DB_NAME = process.env.SERVICE_DB_NAME || 'Сервисная БД'
 
 export async function GET() {

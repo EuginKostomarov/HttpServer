@@ -1428,7 +1428,8 @@ func (db *DB) InsertItemAttributesBatch(normalizedItemID int, attributes []*Item
 // InsertNormalizedItemsWithAttributesBatch вставляет items И их attributes в ОДНОЙ транзакции
 // Это гарантирует атомарность: либо вставляется все (items + attributes), либо ничего
 // Критично для предотвращения частичной вставки при сбоях
-func (db *DB) InsertNormalizedItemsWithAttributesBatch(items []*NormalizedItem, itemAttributes map[string][]*ItemAttribute) (map[string]int, error) {
+// sessionID - опциональный ID сессии нормализации для связи с project_database
+func (db *DB) InsertNormalizedItemsWithAttributesBatch(items []*NormalizedItem, itemAttributes map[string][]*ItemAttribute, sessionID *int) (map[string]int, error) {
 	if len(items) == 0 {
 		return make(map[string]int), nil
 	}
@@ -1443,8 +1444,8 @@ func (db *DB) InsertNormalizedItemsWithAttributesBatch(items []*NormalizedItem, 
 	// Подготавливаем statement для вставки items
 	itemStmt, err := tx.Prepare(`
 		INSERT OR REPLACE INTO normalized_data
-		(source_reference, source_name, code, normalized_name, normalized_reference, category, merged_count, ai_confidence, ai_reasoning, processing_level, kpved_code, kpved_name, kpved_confidence)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		(source_reference, source_name, code, normalized_name, normalized_reference, category, merged_count, ai_confidence, ai_reasoning, processing_level, kpved_code, kpved_name, kpved_confidence, normalization_session_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("failed to prepare item statement: %w", err)
@@ -1480,6 +1481,7 @@ func (db *DB) InsertNormalizedItemsWithAttributesBatch(items []*NormalizedItem, 
 			item.KpvedCode,
 			item.KpvedName,
 			item.KpvedConfidence,
+			sessionID,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to insert normalized item: %w", err)

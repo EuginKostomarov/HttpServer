@@ -584,10 +584,8 @@ func (wcm *WorkerConfigManager) GetNomenclatureConfig() (nomenclature.Config, er
 	config.MaxWorkers = maxWorkers
 	config.RequestTimeout = provider.Timeout
 	
-	// Рассчитываем задержку на основе rate limit
-	if provider.RateLimit > 0 {
-		config.RateLimitDelay = time.Duration(60000/provider.RateLimit) * time.Millisecond
-	}
+	// RateLimitDelay удален - rate limiting теперь контролируется через rate limiter в AIClient
+	// Не нужно устанавливать дополнительную задержку, так как rate limiter уже настроен
 
 	return config, nil
 }

@@ -1,36 +1,48 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
-import { Button } from "@/components/ui/button"
-import { Alert, AlertDescription } from "@/components/ui/alert"
-import { RefreshCw, Database, AlertCircle, Play, Loader2 } from "lucide-react"
-import { DatabaseSelector } from "@/components/database-selector"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { LoadingState } from "@/components/common/loading-state"
 import { EmptyState } from "@/components/common/empty-state"
+import { ErrorState } from "@/components/common/error-state"
 import { QualityOverviewTab } from "@/components/quality/quality-overview-tab"
 import { QualityAnalysisProgress } from "@/components/quality/quality-analysis-progress"
-import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
-import { Label } from "@/components/ui/label"
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import { Input } from "@/components/ui/input"
+import { QualityHeader } from "@/components/quality/quality-header"
+import { QualityAnalysisDialog, AnalysisParams } from "@/components/quality/quality-analysis-dialog"
+import { Card, CardContent } from "@/components/ui/card"
+import { Button } from "@/components/ui/button"
+import { RefreshCw, Database } from "lucide-react"
+import Link from 'next/link'
 import dynamic from 'next/dynamic'
 
-// Динамическая загрузка табов для уменьшения начального bundle
+// Dynamically load tabs to reduce initial bundle size
 const QualityDuplicatesTab = dynamic(
   () => import('@/components/quality/quality-duplicates-tab').then((mod) => ({ default: mod.QualityDuplicatesTab })),
-  { ssr: false }
+  { ssr: false, loading: () => <TabSkeleton /> }
 )
 const QualityViolationsTab = dynamic(
   () => import('@/components/quality/quality-violations-tab').then((mod) => ({ default: mod.QualityViolationsTab })),
-  { ssr: false }
+  { ssr: false, loading: () => <TabSkeleton /> }
 )
 const QualitySuggestionsTab = dynamic(
   () => import('@/components/quality/quality-suggestions-tab').then((mod) => ({ default: mod.QualitySuggestionsTab })),
-  { ssr: false }
+  { ssr: false, loading: () => <TabSkeleton /> }
 )
+const QualityReportTab = dynamic(
+  () => import('@/components/quality/quality-report-tab').then((mod) => ({ default: mod.QualityReportTab })),
+  { ssr: false, loading: () => <TabSkeleton /> }
+)
+
+// Skeleton for tab content loading
+function TabSkeleton() {
+  return (
+    <div className="space-y-4 animate-pulse">
+      <div className="h-32 bg-muted rounded-lg w-full" />
+      <div className="h-64 bg-muted rounded-lg w-full" />
+    </div>
+  )
+}
 
 interface LevelStat {
   count: number
@@ -38,7 +50,7 @@ interface LevelStat {
   percentage: number
 }
 
-interface QualityStats {
+export interface QualityStats {
   total_items: number
   by_level: {
     [key: string]: LevelStat
@@ -48,47 +60,37 @@ interface QualityStats {
   benchmark_percentage: number
 }
 
-const LEVEL_COLORS: {[key: string]: string} = {
-  'basic': '#94a3b8',
-  'ai_enhanced': '#3b82f6',
-  'benchmark': '#10b981',
-}
-
-const LEVEL_NAMES: {[key: string]: string} = {
-  'basic': 'Базовый',
-  'ai_enhanced': 'AI улучшенный',
-  'benchmark': 'Эталонный',
-}
-
 export default function QualityPage() {
   const router = useRouter()
   const searchParams = useSearchParams()
+  
+  // State
   const [stats, setStats] = useState<QualityStats | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [selectedDatabase, setSelectedDatabase] = useState<string>('')
   const [activeTab, setActiveTab] = useState<string>('overview')
   const [showAnalyzeDialog, setShowAnalyzeDialog] = useState(false)
-  const [analyzeTable, setAnalyzeTable] = useState<string>('normalized_data')
-  const [analyzeCodeColumn, setAnalyzeCodeColumn] = useState<string>('')
-  const [analyzeNameColumn, setAnalyzeNameColumn] = useState<string>('')
   const [analyzing, setAnalyzing] = useState(false)
   const [showProgress, setShowProgress] = useState(false)
 
-  // Получаем таб из URL или database из query параметров
+  // Initialize from URL
   useEffect(() => {
     const tab = searchParams.get('tab') || 'overview'
     const db = searchParams.get('database')
+    
     setActiveTab(tab)
     if (db) {
       setSelectedDatabase(db)
     } else if (!selectedDatabase) {
-      // Если database не указан в URL и не выбран, пробуем получить из localStorage или использовать пустую строку
+      // If no DB in URL and none selected, default to empty string
+      // In a real app, we might want to auto-select the last used DB from localStorage
       setSelectedDatabase('')
     }
-  }, [searchParams, selectedDatabase])
+  }, [searchParams])
 
-  const fetchStats = async (database: string) => {
+  // Fetch stats when database changes
+  const fetchStats = useCallback(async (database: string) => {
     if (!database) {
       setStats(null)
       setLoading(false)
@@ -104,6 +106,8 @@ export default function QualityPage() {
         const data = await response.json()
         setStats(data)
       } else {
+        const errorText = await response.text().catch(() => 'Unknown error')
+        console.error('Failed to fetch stats:', response.status, errorText)
         setError('Не удалось загрузить статистику качества')
       }
     } catch (err) {
@@ -112,7 +116,7 @@ export default function QualityPage() {
     } finally {
       setLoading(false)
     }
-  }
+  }, [])
 
   useEffect(() => {
     if (selectedDatabase) {
@@ -120,15 +124,23 @@ export default function QualityPage() {
       const interval = setInterval(() => fetchStats(selectedDatabase), 30000)
       return () => clearInterval(interval)
     }
-  }, [selectedDatabase])
+  }, [selectedDatabase, fetchStats])
 
+  // Handlers
   const handleDatabaseChange = (database: string) => {
     setSelectedDatabase(database)
+    // Update URL
+    const params = new URLSearchParams(searchParams.toString())
+    if (database) {
+      params.set('database', database)
+    } else {
+      params.delete('database')
+    }
+    router.push(`/quality?${params.toString()}`, { scroll: false })
   }
 
   const handleTabChange = (value: string) => {
     setActiveTab(value)
-    // Обновляем URL без перезагрузки страницы
     const params = new URLSearchParams(searchParams.toString())
     params.set('tab', value)
     if (selectedDatabase) {
@@ -137,62 +149,21 @@ export default function QualityPage() {
     router.push(`/quality?${params.toString()}`, { scroll: false })
   }
 
-  const handleStartAnalysis = async () => {
-    if (!selectedDatabase) {
-      setError('Выберите базу данных')
-      return
-    }
+  const handleStartAnalysis = async (params: AnalysisParams) => {
+    if (!selectedDatabase) return
 
     setAnalyzing(true)
     setShowAnalyzeDialog(false)
 
     try {
-      // Определяем колонки по умолчанию если не указаны
-      let codeColumn = analyzeCodeColumn
-      let nameColumn = analyzeNameColumn
-
-      if (!codeColumn) {
-        switch (analyzeTable) {
-          case 'normalized_data':
-            codeColumn = 'code'
-            break
-          case 'nomenclature_items':
-            codeColumn = 'nomenclature_code'
-            break
-          case 'catalog_items':
-            codeColumn = 'code'
-            break
-          default:
-            codeColumn = 'code'
-        }
-      }
-
-      if (!nameColumn) {
-        switch (analyzeTable) {
-          case 'normalized_data':
-            nameColumn = 'normalized_name'
-            break
-          case 'nomenclature_items':
-            nameColumn = 'nomenclature_name'
-            break
-          case 'catalog_items':
-            nameColumn = 'name'
-            break
-          default:
-            nameColumn = 'name'
-        }
-      }
-
       const response = await fetch('/api/quality/analyze', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           database: selectedDatabase,
-          table: analyzeTable,
-          code_column: codeColumn,
-          name_column: nameColumn,
+          table: params.table,
+          code_column: params.codeColumn,
+          name_column: params.nameColumn,
         }),
       })
 
@@ -214,59 +185,19 @@ export default function QualityPage() {
 
   const handleAnalysisComplete = () => {
     setShowProgress(false)
-    // Обновляем статистику и данные на странице
     if (selectedDatabase) {
       fetchStats(selectedDatabase)
-      // Не перезагружаем страницу, просто обновим данные через небольшую задержку
-      // чтобы дать время БД обновиться
-      setTimeout(() => {
-        // Триггерим обновление через изменение ключа или состояния
-        setActiveTab(activeTab) // Это заставит табы перезагрузить данные
-      }, 1000)
+      // Trigger tab refresh via key/state update if needed
+      // Currently, tabs fetch their own data based on 'database' prop change or internal logic
+      // We might need to force a refresh if they cache data aggressively
     }
   }
 
-  const handleTableChange = (table: string) => {
-    setAnalyzeTable(table)
-    // Автозаполнение колонок
-    switch (table) {
-      case 'normalized_data':
-        setAnalyzeCodeColumn('code')
-        setAnalyzeNameColumn('normalized_name')
-        break
-      case 'nomenclature_items':
-        setAnalyzeCodeColumn('nomenclature_code')
-        setAnalyzeNameColumn('nomenclature_name')
-        break
-      case 'catalog_items':
-        setAnalyzeCodeColumn('code')
-        setAnalyzeNameColumn('name')
-        break
-      default:
-        setAnalyzeCodeColumn('')
-        setAnalyzeNameColumn('')
-    }
-  }
-
-  // Empty state - no database selected
-  if (!selectedDatabase) {
-    return (
-      <div className="container mx-auto px-4 py-8">
-        <div className="mb-8 flex items-center justify-between">
-          <div>
-            <h1 className="text-3xl font-bold mb-2">Качество нормализации</h1>
-            <p className="text-muted-foreground">
-              Метрики качества обработки данных и управление качеством
-            </p>
-          </div>
-          <DatabaseSelector
-            value={selectedDatabase}
-            onChange={handleDatabaseChange}
-            className="w-[300px]"
-          />
-        </div>
-
-        <Card className="border-dashed">
+  // Determine Content State
+  const renderContent = () => {
+    if (!selectedDatabase) {
+      return (
+        <Card className="border-dashed mt-8">
           <CardContent className="pt-6">
             <EmptyState
               icon={Database}
@@ -275,204 +206,120 @@ export default function QualityPage() {
             />
           </CardContent>
         </Card>
-      </div>
-    )
-  }
+      )
+    }
 
-  // Loading state
-  if (loading && !stats) {
+    // Initial loading for stats
+    if (loading && !stats) {
+      return <LoadingState message="Загрузка статистики качества..." size="lg" className="mt-12" />
+    }
+
+    if (error && !stats) {
+      return (
+        <ErrorState
+          title="Ошибка загрузки статистики"
+          message={error}
+          action={{
+            label: 'Повторить',
+            onClick: () => fetchStats(selectedDatabase),
+          }}
+          variant="destructive"
+          className="mt-8"
+        />
+      )
+    }
+
+    // Empty stats state (DB not processed)
+    if (stats && stats.total_items === 0) {
+      return (
+        <Card className="border-amber-200 bg-amber-50/50 mt-8">
+          <CardContent className="pt-6">
+            <div className="flex items-start gap-4">
+              <div className="rounded-full bg-amber-100 p-2">
+                <RefreshCw className="h-5 w-5 text-amber-600 animate-spin" />
+              </div>
+              <div className="flex-1">
+                <h3 className="font-semibold text-amber-900 mb-1">
+                  База данных не была обработана
+                </h3>
+                <p className="text-sm text-amber-800 mb-4">
+                  По выбранной базе данных еще не было обработано элементов. 
+                  Пожалуйста, запустите нормализацию и ожидайте завершения обработки.
+                </p>
+                <Button asChild>
+                  <Link href={`/processes?tab=normalization&database=${encodeURIComponent(selectedDatabase)}`}>
+                    Запустить нормализацию
+                  </Link>
+                </Button>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+      )
+    }
+
+    // Main Content
     return (
-      <div className="container mx-auto px-4 py-8">
-        <div className="mb-8 flex items-center justify-between">
-          <div>
-            <h1 className="text-3xl font-bold mb-2">Качество нормализации</h1>
-            <p className="text-muted-foreground">
-              Метрики качества обработки данных и управление качеством
-            </p>
-          </div>
-          <DatabaseSelector
-            value={selectedDatabase}
-            onChange={handleDatabaseChange}
-            className="w-[300px]"
-          />
-        </div>
-        <LoadingState message="Загрузка статистики качества..." size="lg" fullScreen />
-      </div>
-    )
-  }
-
-  // Error state
-  if (error && !stats) {
-    return (
-      <div className="container mx-auto px-4 py-8">
-        <div className="mb-8 flex items-center justify-between">
-          <div>
-            <h1 className="text-3xl font-bold mb-2">Качество нормализации</h1>
-            <p className="text-muted-foreground">
-              Метрики качества обработки данных и управление качеством
-            </p>
-          </div>
-          <DatabaseSelector
-            value={selectedDatabase}
-            onChange={handleDatabaseChange}
-            className="w-[300px]"
-          />
-        </div>
-        <Alert variant="destructive">
-          <AlertCircle className="h-4 w-4" />
-          <AlertDescription className="flex items-center justify-between">
-            <span>{error || 'Нет данных для отображения'}</span>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => fetchStats(selectedDatabase)}
-            >
-              <RefreshCw className="h-4 w-4 mr-2" />
-              Повторить
-            </Button>
-          </AlertDescription>
-        </Alert>
-      </div>
-    )
-  }
-
-  return (
-    <div className="container mx-auto px-4 py-8">
-      {/* Header with Database Selector */}
-      <div className="mb-8 flex items-center justify-between gap-4">
-        <div>
-          <h1 className="text-3xl font-bold mb-2">Качество нормализации</h1>
-          <p className="text-muted-foreground">
-            Метрики качества обработки данных и управление качеством
-          </p>
-        </div>
-        <div className="flex items-center gap-3">
-          <DatabaseSelector
-            value={selectedDatabase}
-            onChange={handleDatabaseChange}
-            className="w-[300px]"
-          />
-          <Button
-            variant="outline"
-            size="icon"
-            onClick={() => fetchStats(selectedDatabase)}
-            title="Обновить данные"
-          >
-            <RefreshCw className="h-4 w-4" />
-          </Button>
-          <Button
-            onClick={() => setShowAnalyzeDialog(true)}
-            disabled={!selectedDatabase || analyzing}
-            title="Запустить анализ качества"
-          >
-            {analyzing ? (
-              <>
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                Запуск...
-              </>
-            ) : (
-              <>
-                <Play className="mr-2 h-4 w-4" />
-                Запустить анализ
-              </>
-            )}
-          </Button>
-        </div>
-      </div>
-
-      {/* Progress Card */}
-      {showProgress && (
-        <QualityAnalysisProgress onComplete={handleAnalysisComplete} />
-      )}
-
-      {/* Analyze Dialog */}
-      <Dialog open={showAnalyzeDialog} onOpenChange={setShowAnalyzeDialog}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Запуск анализа качества</DialogTitle>
-            <DialogDescription>
-              Выберите таблицу для анализа качества данных. Анализ найдет дубликаты, нарушения правил и сгенерирует предложения по улучшению.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-4 py-4">
-            <div className="space-y-2">
-              <Label htmlFor="table">Таблица</Label>
-              <Select value={analyzeTable} onValueChange={handleTableChange}>
-                <SelectTrigger id="table">
-                  <SelectValue placeholder="Выберите таблицу" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="normalized_data">normalized_data</SelectItem>
-                  <SelectItem value="nomenclature_items">nomenclature_items</SelectItem>
-                  <SelectItem value="catalog_items">catalog_items</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="code-column">Колонка с кодом (опционально)</Label>
-              <Input
-                id="code-column"
-                value={analyzeCodeColumn}
-                onChange={(e) => setAnalyzeCodeColumn(e.target.value)}
-                placeholder="Автозаполнение по таблице"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="name-column">Колонка с названием (опционально)</Label>
-              <Input
-                id="name-column"
-                value={analyzeNameColumn}
-                onChange={(e) => setAnalyzeNameColumn(e.target.value)}
-                placeholder="Автозаполнение по таблице"
-              />
-            </div>
-          </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setShowAnalyzeDialog(false)}>
-              Отмена
-            </Button>
-            <Button onClick={handleStartAnalysis} disabled={!selectedDatabase || analyzing}>
-              {analyzing ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Запуск...
-                </>
-              ) : (
-                <>
-                  <Play className="mr-2 h-4 w-4" />
-                  Запустить
-                </>
-              )}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      {/* Tabs Navigation */}
-      <Tabs value={activeTab} onValueChange={handleTabChange} className="space-y-6">
-        <TabsList>
+      <Tabs value={activeTab} onValueChange={handleTabChange} className="space-y-6 mt-8">
+        <TabsList className="grid w-full grid-cols-2 lg:w-auto lg:inline-flex lg:grid-cols-none">
           <TabsTrigger value="overview">Обзор</TabsTrigger>
           <TabsTrigger value="duplicates">Дубликаты</TabsTrigger>
           <TabsTrigger value="violations">Нарушения</TabsTrigger>
           <TabsTrigger value="suggestions">Предложения</TabsTrigger>
+          <TabsTrigger value="report">Отчёт</TabsTrigger>
         </TabsList>
 
-        <TabsContent value="overview" className="space-y-6">
-          {stats && <QualityOverviewTab stats={stats} loading={loading} />}
+        <TabsContent value="overview" className="space-y-6 min-h-[400px]">
+          {stats ? (
+            <QualityOverviewTab stats={stats} loading={loading} />
+          ) : (
+            <LoadingState message="Подготовка обзора..." />
+          )}
         </TabsContent>
 
-        <TabsContent value="duplicates" className="space-y-6">
+        <TabsContent value="duplicates" className="space-y-6 min-h-[400px]">
           <QualityDuplicatesTab database={selectedDatabase} />
         </TabsContent>
 
-        <TabsContent value="violations" className="space-y-6">
+        <TabsContent value="violations" className="space-y-6 min-h-[400px]">
           <QualityViolationsTab database={selectedDatabase} />
         </TabsContent>
 
-        <TabsContent value="suggestions" className="space-y-6">
+        <TabsContent value="suggestions" className="space-y-6 min-h-[400px]">
           <QualitySuggestionsTab database={selectedDatabase} />
         </TabsContent>
+
+        <TabsContent value="report" className="space-y-6 min-h-[400px]">
+          <QualityReportTab database={selectedDatabase} stats={stats} />
+        </TabsContent>
       </Tabs>
+    )
+  }
+
+  return (
+    <div className="container mx-auto px-4 py-8 max-w-7xl">
+      <QualityHeader
+        selectedDatabase={selectedDatabase}
+        onDatabaseChange={handleDatabaseChange}
+        onRefresh={() => fetchStats(selectedDatabase)}
+        onAnalyze={() => setShowAnalyzeDialog(true)}
+        analyzing={analyzing}
+        loading={loading}
+      />
+
+      {showProgress && (
+        <QualityAnalysisProgress onComplete={handleAnalysisComplete} />
+      )}
+
+      <QualityAnalysisDialog
+        open={showAnalyzeDialog}
+        onOpenChange={setShowAnalyzeDialog}
+        selectedDatabase={selectedDatabase}
+        onStartAnalysis={handleStartAnalysis}
+        analyzing={analyzing}
+      />
+
+      {renderContent()}
     </div>
   )
 }

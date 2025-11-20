@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Отчет о тестировании загрузки базы данных</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #2c3e50;
+            border-bottom: 3px solid #3498db;
+            padding-bottom: 10px;
+        }
+        h2 {
+            color: #34495e;
+            margin-top: 30px;
+        }
+        .test-section {
+            margin: 20px 0;
+            padding: 15px;
+            background: #f8f9fa;
+            border-left: 4px solid #3498db;
+            border-radius: 4px;
+        }
+        .success {
+            color: #27ae60;
+            font-weight: bold;
+        }
+        .error {
+            color: #e74c3c;
+            font-weight: bold;
+        }
+        .warning {
+            color: #f39c12;
+            font-weight: bold;
+        }
+        .info {
+            color: #3498db;
+        }
+        pre {
+            background: #2c3e50;
+            color: #ecf0f1;
+            padding: 15px;
+            border-radius: 4px;
+            overflow-x: auto;
+        }
+        .summary {
+            background: #e8f5e9;
+            padding: 20px;
+            border-radius: 4px;
+            margin-top: 30px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 15px 0;
+        }
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }
+        th {
+            background: #3498db;
+            color: white;
+        }
+        tr:hover {
+            background: #f5f5f5;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📊 Отчет о тестировании загрузки базы данных</h1>
+        <p><strong>Дата:</strong> 2025-11-20 14:05</p>
+        <p><strong>Тестируемый файл:</strong> Выгрузка_Контрагенты_ERPWE_Unknown_Unknown_2025_11_20_13_27_39.db</p>
+
+        <h2>✅ Результаты тестирования</h2>
+
+        <div class="test-section">
+            <h3>1. Проверка файла</h3>
+            <p class="success">✓ Файл найден и доступен</p>
+            <ul>
+                <li><strong>Путь:</strong> data/uploads/Выгрузка_Контрагенты_ERPWE_Unknown_Unknown_2025_11_20_13_27_39.db</li>
+                <li><strong>Размер:</strong> 1.65 MB</li>
+                <li><strong>Паттерн:</strong> Соответствует паттерну "Выгрузка_Контрагенты_*"</li>
+            </ul>
+        </div>
+
+        <div class="test-section">
+            <h3>2. Функция сканирования</h3>
+            <p class="success">✓ Функция ScanForDatabaseFiles работает корректно</p>
+            <pre>Результат: Найдено 1 файл
+E:\HttpServer\data\uploads\Выгрузка_Контрагенты_ERPWE_Unknown_Unknown_2025_11_20_13_27_39.db</pre>
+        </div>
+
+        <div class="test-section">
+            <h3>3. API эндпоинты</h3>
+            <table>
+                <tr>
+                    <th>Эндпоинт</th>
+                    <th>Статус</th>
+                    <th>Примечание</th>
+                </tr>
+                <tr>
+                    <td>GET /api/databases/pending</td>
+                    <td class="error">404 Not Found</td>
+                    <td>Требуется исправление маршрутизации или перезапуск сервера</td>
+                </tr>
+                <tr>
+                    <td>POST /api/databases/scan</td>
+                    <td class="error">404 Not Found</td>
+                    <td>Требуется исправление маршрутизации или перезапуск сервера</td>
+                </tr>
+                <tr>
+                    <td>GET /api/clients</td>
+                    <td class="success">200 OK</td>
+                    <td>Работает корректно</td>
+                </tr>
+                <tr>
+                    <td>GET /health</td>
+                    <td class="success">200 OK</td>
+                    <td>Работает корректно</td>
+                </tr>
+            </table>
+        </div>
+
+        <div class="test-section">
+            <h3>4. Service Database</h3>
+            <p class="warning">⚠ Проблема с подключением к service.db</p>
+            <p><strong>Ошибка:</strong> failed to initialize service schema: failed to create service schema: no such column: tax_id</p>
+            <p><strong>Причина:</strong> Устаревшая схема базы данных service.db требует миграции</p>
+            <p><strong>Решение:</strong> Необходимо обновить схему базы данных или пересоздать service.db</p>
+        </div>
+
+        <div class="summary">
+            <h2>📋 Итоговый вывод</h2>
+            <h3 class="success">Что работает:</h3>
+            <ul>
+                <li>✓ Файл базы данных найден и доступен</li>
+                <li>✓ Функция сканирования работает корректно</li>
+                <li>✓ Файл соответствует требуемому паттерну</li>
+                <li>✓ Основные API эндпоинты (health, clients) работают</li>
+            </ul>
+
+            <h3 class="warning">Требует внимания:</h3>
+            <ul>
+                <li>⚠ Эндпоинты /api/databases/pending и /api/databases/scan возвращают 404</li>
+                <li>⚠ Service database требует обновления схемы</li>
+            </ul>
+
+            <h3 class="info">Рекомендации:</h3>
+            <ol>
+                <li>Исправить маршрутизацию для эндпоинтов pending databases и scan</li>
+                <li>Обновить схему service.db или пересоздать базу данных</li>
+                <li>После исправлений протестировать полный цикл: сканирование → pending → привязка к проекту</li>
+            </ol>
+        </div>
+
+        <h2>🔧 Технические детали</h2>
+        <div class="test-section">
+            <h3>Тестируемые функции:</h3>
+            <ul>
+                <li><code>server.ScanForDatabaseFiles()</code> - работает ✓</li>
+                <li><code>server.MoveDatabaseToUploads()</code> - не тестировалась</li>
+                <li><code>database.GetPendingDatabases()</code> - требует serviceDB</li>
+                <li><code>database.CreatePendingDatabase()</code> - требует serviceDB</li>
+            </ul>
+        </div>
+
+        <div class="test-section">
+            <h3>Структура файла:</h3>
+            <pre>Имя: Выгрузка_Контрагенты_ERPWE_Unknown_Unknown_2025_11_20_13_27_39.db
+Путь: E:\HttpServer\data\uploads\
+Размер: 1,732,608 байт (1.65 MB)
+Тип: SQLite база данных
+Паттерн: Выгрузка_Контрагенты_* ✓</pre>
+        </div>
+    </div>
+</body>
+</html>
+

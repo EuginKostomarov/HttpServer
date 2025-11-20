@@ -9,12 +9,15 @@ import { Badge } from "@/components/ui/badge"
 import { 
   Building2, 
   Plus,
-  Target
+  Target,
+  Globe,
+  ArrowLeft
 } from "lucide-react"
 import { LoadingState } from "@/components/common/loading-state"
 import { EmptyState } from "@/components/common/empty-state"
 import { ErrorState } from "@/components/common/error-state"
 import { StatCard } from "@/components/common/stat-card"
+import { getCountryByCode } from '@/lib/countries'
 
 interface ClientDetail {
   client: {
@@ -25,6 +28,7 @@ interface ClientDetail {
     contact_email: string
     contact_phone: string
     tax_id: string
+    country?: string
     status: string
     created_at: string
   }
@@ -78,6 +82,7 @@ export default function ClientDetailPage() {
     const labels: Record<string, string> = {
       nomenclature: 'Номенклатура',
       counterparties: 'Контрагенты',
+      nomenclature_counterparties: 'Номенклатура + Контрагенты',
       mixed: 'Смешанный'
     }
     return labels[type] || type
@@ -109,9 +114,14 @@ export default function ClientDetailPage() {
 
   return (
     <div className="container mx-auto p-6 space-y-6">
-      {/* Заголовок и действия */}
-      <div className="flex items-center justify-between">
-        <div>
+      {/* Кнопка назад */}
+      <div className="flex items-center gap-4">
+        <Button variant="outline" size="icon" asChild>
+          <Link href="/clients">
+            <ArrowLeft className="h-4 w-4" />
+          </Link>
+        </Button>
+        <div className="flex-1">
           <h1 className="text-3xl font-bold">{client.client.name}</h1>
           <p className="text-muted-foreground">{client.client.description}</p>
           {client.client.legal_name && (
@@ -119,7 +129,11 @@ export default function ClientDetailPage() {
           )}
         </div>
         <div className="flex gap-2">
-          <Button variant="outline">Редактировать</Button>
+          <Button variant="outline" asChild>
+            <Link href={`/clients/${clientId}/edit`}>
+              Редактировать
+            </Link>
+          </Button>
           <Button asChild>
             <Link href={`/clients/${clientId}/projects/new`}>
               <Plus className="mr-2 h-4 w-4" />
@@ -222,8 +236,19 @@ export default function ClientDetailPage() {
             </div>
             {client.client.tax_id && (
               <div className="flex justify-between">
-                <span className="text-sm text-muted-foreground">ИНН:</span>
+                <span className="text-sm text-muted-foreground">ИНН/БИН:</span>
                 <span className="text-sm font-medium">{client.client.tax_id}</span>
+              </div>
+            )}
+            {client.client.country && (
+              <div className="flex justify-between">
+                <span className="text-sm text-muted-foreground flex items-center gap-1">
+                  <Globe className="h-3 w-3" />
+                  Страна:
+                </span>
+                <span className="text-sm font-medium">
+                  {getCountryByCode(client.client.country)?.name || client.client.country}
+                </span>
               </div>
             )}
             {client.client.contact_email && (

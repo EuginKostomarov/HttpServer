@@ -35,6 +35,10 @@ const LEVEL_NAMES: {[key: string]: string} = {
   'benchmark': 'Эталонный',
 }
 
+import { normalizePercentage } from '@/lib/locale'
+
+const normalizeQuality = normalizePercentage
+
 interface QualityOverviewTabProps {
   stats: QualityStats | null
   loading: boolean
@@ -53,7 +57,7 @@ export function QualityOverviewTab({ stats, loading }: QualityOverviewTabProps) 
 
   const barData = Object.entries(stats.by_level || {}).map(([level, data]) => ({
     name: LEVEL_NAMES[level] || level,
-    quality: (data.avg_quality * 100).toFixed(1),
+    quality: normalizeQuality(data.avg_quality).toFixed(1),
     count: data.count,
   }))
 
@@ -71,9 +75,9 @@ export function QualityOverviewTab({ stats, loading }: QualityOverviewTabProps) 
 
         <StatCard
           title="Средняя оценка"
-          value={`${(stats.average_quality * 100).toFixed(1)}%`}
+          value={`${normalizeQuality(stats.average_quality).toFixed(1)}%`}
           icon={Target}
-          progress={stats.average_quality * 100}
+          progress={normalizeQuality(stats.average_quality)}
         />
 
         <StatCard
@@ -176,7 +180,7 @@ export function QualityOverviewTab({ stats, loading }: QualityOverviewTabProps) 
                 </div>
                 <div className="text-right">
                   <Badge variant="outline">
-                    Качество: {(data.avg_quality * 100).toFixed(1)}%
+                    Качество: {normalizeQuality(data.avg_quality).toFixed(1)}%
                   </Badge>
                 </div>
               </div>

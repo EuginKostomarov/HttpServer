@@ -1,13 +1,20 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
+import { formatDateTime } from '@/lib/locale'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
+import { DatabaseSelector } from '@/components/database-selector'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
 import { Alert, AlertDescription } from "@/components/ui/alert"
+import { ErrorState } from "@/components/common/error-state"
+import { EmptyState } from "@/components/common/empty-state"
+import { FadeIn } from "@/components/animations/fade-in"
+import { StaggerContainer, StaggerItem } from "@/components/animations/stagger-container"
+import { motion } from "framer-motion"
 import {
   Select,
   SelectContent,
@@ -34,6 +41,10 @@ import { handleApiError } from "@/lib/errors"
 import { ClientCache } from "@/lib/cache"
 import { Pagination } from "@/components/ui/pagination"
 import { DataTable, type Column } from "@/components/common/data-table"
+import { Breadcrumb } from "@/components/ui/breadcrumb"
+import { BreadcrumbList } from "@/components/seo/breadcrumb-list"
+import { BarChart3, Download, FileSpreadsheet, FileCode, FileJson, RefreshCw } from "lucide-react"
+import { exportGroupsToCSV, exportGroupsToJSON, exportGroupsToExcel } from "@/lib/export-results"
 
 interface Group {
   normalized_name: string
@@ -87,31 +98,9 @@ export default function ResultsPage() {
   const [selectedCategory, setSelectedCategory] = useState<string>('')
   const [selectedKpvedCode, setSelectedKpvedCode] = useState<string | null>(null)
   const [inputValue, setInputValue] = useState('')
+  const [selectedDatabase, setSelectedDatabase] = useState<string>('')
 
   const limit = 20
-
-  // Загрузка статистики
-  useEffect(() => {
-    fetchStats()
-  }, [])
-
-  // Debounced search - автоматический поиск при вводе с задержкой
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      if (inputValue !== searchQuery) {
-        setSearchQuery(inputValue)
-        setCurrentPage(1)
-      }
-    }, 500) // 500ms debounce delay
-
-    return () => clearTimeout(timer)
-  }, [inputValue, searchQuery])
-
-  // Загрузка групп при изменении фильтров или страницы
-  useEffect(() => {
-    fetchGroups()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentPage, searchQuery, selectedCategory, selectedKpvedCode])
 
   const fetchStats = async () => {
     // Проверяем кеш сначала
@@ -129,10 +118,18 @@ export default function ResultsPage() {
       ClientCache.set('normalization_stats', data, 5 * 60 * 1000)
     } catch (error) {
       console.error('Error fetching stats:', error)
+      // Устанавливаем пустую статистику при ошибке
+      setStats({
+        totalGroups: 0,
+        totalItems: 0,
+        totalItemsWithAttributes: 0,
+        mergedItems: 0,
+        categories: {},
+      })
     }
   }
 
-  const fetchGroups = async () => {
+  const fetchGroups = useCallback(async () => {
     setIsLoading(true)
     setError(null)
     try {
@@ -172,7 +169,29 @@ export default function ResultsPage() {
     } finally {
       setIsLoading(false)
     }
-  }
+  }, [currentPage, searchQuery, selectedCategory, selectedKpvedCode])
+
+  // Загрузка статистики
+  useEffect(() => {
+    fetchStats()
+  }, [])
+
+  // Debounced search - автоматический поиск при вводе с задержкой
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (inputValue !== searchQuery) {
+        setSearchQuery(inputValue)
+        setCurrentPage(1)
+      }
+    }, 500) // 500ms debounce delay
+
+    return () => clearTimeout(timer)
+  }, [inputValue, searchQuery])
+
+  // Загрузка групп при изменении фильтров или страницы
+  useEffect(() => {
+    fetchGroups()
+  }, [fetchGroups])
 
   const handleRowClick = (group: Group) => {
     try {
@@ -217,83 +236,154 @@ export default function ResultsPage() {
   // Получаем список категорий из статистики
   const categories = stats?.categories ? Object.keys(stats.categories).sort() : []
 
+  const breadcrumbItems = [
+    { label: 'Результаты', href: '/results', icon: BarChart3 },
+  ]
+
   return (
-    <div className="container mx-auto p-6 space-y-6">
-      {/* Заголовок */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-3xl font-bold">Результаты нормализации</h1>
-          <p className="text-muted-foreground">
-            Просмотр нормализованных данных по группам
-          </p>
-        </div>
-        <div className="flex gap-2">
-          <Button asChild variant="outline">
-            <Link href="/processes?tab=normalization">
-              Запустить нормализацию
-            </Link>
-          </Button>
-          <Button asChild variant="outline">
-            <Link href="/normalization">
-              Назад к нормализации
-            </Link>
-          </Button>
-        </div>
+    <div className="container-wide mx-auto p-6 space-y-6">
+      <BreadcrumbList items={breadcrumbItems.map(item => ({ label: item.label, href: item.href || '#' }))} />
+      <div className="mb-4">
+        <Breadcrumb items={breadcrumbItems} />
       </div>
+      {/* Заголовок */}
+      <FadeIn>
+        <div className="flex items-center justify-between">
+          <div>
+            <motion.h1 
+              className="text-3xl font-bold"
+              initial={{ opacity: 0, y: -20 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.5 }}
+            >
+              Результаты нормализации
+            </motion.h1>
+            <motion.p 
+              className="text-muted-foreground"
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.5, delay: 0.1 }}
+            >
+              Просмотр нормализованных данных по группам
+            </motion.p>
+          </div>
+          <div className="flex gap-2 items-center">
+            <DatabaseSelector
+              value={selectedDatabase}
+              onChange={setSelectedDatabase}
+              className="w-[250px]"
+              placeholder="Выберите БД для обработки"
+            />
+            <Button asChild>
+              <Link href={selectedDatabase ? `/processes?tab=normalization&database=${encodeURIComponent(selectedDatabase)}` : '/processes?tab=normalization'}>
+                Запустить нормализацию
+              </Link>
+            </Button>
+            <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
+              <Button asChild variant="outline">
+                <Link href="/normalization">
+                  Назад к нормализации
+                </Link>
+              </Button>
+            </motion.div>
+          </div>
+        </div>
+      </FadeIn>
 
       {/* Статистика */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium">Исправлено элементов</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="text-2xl font-bold">
-              {(stats?.totalItems ?? 0).toLocaleString()}
-            </div>
-            <p className="text-xs text-muted-foreground">
-              элементов с разложенными атрибутами
-            </p>
-          </CardContent>
-        </Card>
+      <StaggerContainer className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <StaggerItem>
+          <motion.div whileHover={{ scale: 1.02 }} transition={{ type: "spring", stiffness: 300 }}>
+            <Card>
+              <CardHeader className="pb-2">
+                <CardTitle className="text-sm font-medium">Исправлено элементов</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="text-2xl font-bold">
+                  {(stats?.totalItems ?? 0).toLocaleString()}
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  элементов с разложенными атрибутами
+                </p>
+              </CardContent>
+            </Card>
+          </motion.div>
+        </StaggerItem>
 
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium">С атрибутами</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="text-2xl font-bold">
-              {(stats?.totalItemsWithAttributes ?? 0).toLocaleString()}
-            </div>
-            <p className="text-xs text-muted-foreground">
-              элементов с извлеченными размерами/брендами
-            </p>
-          </CardContent>
-        </Card>
+        <StaggerItem>
+          <motion.div whileHover={{ scale: 1.02 }} transition={{ type: "spring", stiffness: 300 }}>
+            <Card>
+              <CardHeader className="pb-2">
+                <CardTitle className="text-sm font-medium">С атрибутами</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="text-2xl font-bold">
+                  {(stats?.totalItemsWithAttributes ?? 0).toLocaleString()}
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  элементов с извлеченными размерами/брендами
+                </p>
+              </CardContent>
+            </Card>
+          </motion.div>
+        </StaggerItem>
 
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium">Объединено</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="text-2xl font-bold">
-              {(stats?.mergedItems ?? 0).toLocaleString()}
+        <StaggerItem>
+          <motion.div whileHover={{ scale: 1.02 }} transition={{ type: "spring", stiffness: 300 }}>
+            <Card>
+              <CardHeader className="pb-2">
+                <CardTitle className="text-sm font-medium">Объединено</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="text-2xl font-bold">
+                  {(stats?.mergedItems ?? 0).toLocaleString()}
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  дубликатов найдено и объединено
+                </p>
+              </CardContent>
+            </Card>
+          </motion.div>
+        </StaggerItem>
+      </StaggerContainer>
+
+      {/* Проверка: база данных не была обработана */}
+      {stats && stats.totalItems === 0 && stats.totalGroups === 0 && !isLoading && (
+        <Card className="border-amber-200 bg-amber-50/50">
+          <CardContent className="pt-6">
+            <div className="flex items-start gap-4">
+              <div className="rounded-full bg-amber-100 p-2">
+                <RefreshCw className="h-5 w-5 text-amber-600 animate-spin" />
+              </div>
+              <div className="flex-1">
+                <h3 className="font-semibold text-amber-900 mb-1">
+                  База данных не была обработана
+                </h3>
+                <p className="text-sm text-amber-800">
+                  По выбранной базе данных еще не было обработано элементов. 
+                  Пожалуйста, запустите нормализацию и ожидайте завершения обработки.
+                </p>
+                <div className="mt-4">
+                  <Button asChild>
+                    <Link href={selectedDatabase ? `/processes?tab=normalization&database=${encodeURIComponent(selectedDatabase)}` : '/processes?tab=normalization'}>
+                      Запустить нормализацию
+                    </Link>
+                  </Button>
+                </div>
+              </div>
             </div>
-            <p className="text-xs text-muted-foreground">
-              дубликатов найдено и объединено
-            </p>
           </CardContent>
         </Card>
-      </div>
+      )}
 
       {/* Информация о последней нормализации */}
-      {stats?.last_normalized_at && (
+      {stats?.last_normalized_at && stats.totalItems > 0 && (
         <Card>
           <CardContent className="pt-6">
             <div className="text-sm text-muted-foreground">
               <span className="font-medium">Последняя нормализация: </span>
               <span>
-                {new Date(stats.last_normalized_at).toLocaleString('ru-RU', {
+                {formatDateTime(stats.last_normalized_at, {
                   day: '2-digit',
                   month: '2-digit',
                   year: 'numeric',
@@ -405,30 +495,74 @@ export default function ResultsPage() {
       {/* Таблица групп */}
       <Card>
         <CardHeader>
-          <CardTitle>Группы товаров</CardTitle>
-          <CardDescription>
-            Страница {currentPage} из {totalPages} • Всего групп: {totalGroups}
-          </CardDescription>
+          <div className="flex justify-between items-start">
+            <div>
+              <CardTitle>Группы товаров</CardTitle>
+              <CardDescription>
+                Страница {currentPage} из {totalPages} • Всего групп: {totalGroups}
+              </CardDescription>
+            </div>
+            {groups.length > 0 && (
+              <div className="flex flex-wrap gap-2">
+                <Button 
+                  variant="outline" 
+                  size="sm"
+                  onClick={() => exportGroupsToCSV(groups, selectedDatabase)}
+                  disabled={isLoading}
+                >
+                  <FileCode className="h-4 w-4 mr-2" />
+                  CSV
+                </Button>
+                <Button 
+                  variant="outline" 
+                  size="sm"
+                  onClick={() => exportGroupsToJSON(groups, selectedDatabase)}
+                  disabled={isLoading}
+                >
+                  <FileJson className="h-4 w-4 mr-2" />
+                  JSON
+                </Button>
+                <Button 
+                  variant="outline" 
+                  size="sm"
+                  onClick={() => exportGroupsToExcel(groups, selectedDatabase)}
+                  disabled={isLoading}
+                >
+                  <FileSpreadsheet className="h-4 w-4 mr-2" />
+                  Excel
+                </Button>
+              </div>
+            )}
+          </div>
         </CardHeader>
         <CardContent>
-          {error && (
-            <Alert variant="destructive" className="mb-4" role="alert" aria-live="assertive">
-              <AlertDescription className="flex items-center justify-between">
-                <span>{error}</span>
-                <Button onClick={fetchGroups} variant="outline" size="sm" aria-label="Повторить загрузку данных">
-                  Повторить
-                </Button>
-              </AlertDescription>
-            </Alert>
-          )}
-          {isLoading ? (
+          {error && !isLoading ? (
+            <ErrorState
+              title="Ошибка загрузки данных"
+              message={error}
+              action={{
+                label: 'Повторить',
+                onClick: fetchGroups,
+              }}
+              variant="destructive"
+            />
+          ) : isLoading ? (
             <div role="status" aria-live="polite" aria-label="Загрузка данных">
               <TableSkeleton rows={10} columns={8} />
             </div>
+          ) : stats && stats.totalItems === 0 && stats.totalGroups === 0 ? (
+            <EmptyState
+              icon={RefreshCw}
+              title="База данных не была обработана"
+              description="По выбранной базе данных еще не было обработано элементов. Запустите нормализацию и ожидайте завершения обработки."
+            />
           ) : groups.length === 0 ? (
-            <div className="text-center py-8" role="status">
-              <p className="text-muted-foreground">Групп не найдено</p>
-            </div>
+            <EmptyState
+              title="Групп не найдено"
+              description={searchQuery || selectedCategory || selectedKpvedCode 
+                ? "Попробуйте изменить фильтры поиска" 
+                : "Нет данных для отображения. Запустите нормализацию для получения результатов."}
+            />
           ) : (
             <>
               <DataTable

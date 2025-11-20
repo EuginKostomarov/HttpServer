@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { kpvedLoadSchema, validateRequest, formatValidationError } from '@/lib/validation'
+import { getBackendUrl } from '@/lib/api-config'
 
-const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:9999'
+const BACKEND_URL = getBackendUrl()
 
 export async function POST(request: NextRequest) {
   try {

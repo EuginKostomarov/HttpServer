@@ -88,11 +88,22 @@ func NewArliaiClient() *ArliaiClient {
 		log.Printf("Warning: Arliai configuration validation failed: %v", err)
 	}
 
+	// Оптимизированный HTTP Transport с connection pooling для переиспользования соединений
+	transport := &http.Transport{
+		MaxIdleConns:        10,
+		MaxConnsPerHost:     5,
+		IdleConnTimeout:     90 * time.Second,
+		DisableKeepAlives:   false,
+		DisableCompression:  false,
+		MaxIdleConnsPerHost: 5,
+	}
+
 	return &ArliaiClient{
 		baseURL: baseURL,
 		apiKey:  apiKey,
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout:   30 * time.Second,
+			Transport: transport,
 		},
 		retryConfig: RetryConfig{
 			MaxRetries:       3,

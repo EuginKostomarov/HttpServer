@@ -77,7 +77,13 @@ export function MetricsChart({
     const lastSegment = values.slice(-splitPoint)
     const firstAvg = firstSegment.reduce((a, b) => a + b, 0) / firstSegment.length
     const lastAvg = lastSegment.reduce((a, b) => a + b, 0) / lastSegment.length
-    const trend = ((lastAvg - firstAvg) / firstAvg) * 100
+    
+    let trend = 0
+    if (firstAvg !== 0) {
+      trend = ((lastAvg - firstAvg) / firstAvg) * 100
+    } else if (lastAvg !== 0) {
+      trend = 100 // If started from 0 and increased, consider it 100% growth
+    }
 
     return { min, max, avg, latest, trend }
   }, [data])

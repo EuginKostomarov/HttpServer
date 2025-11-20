@@ -16,6 +16,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group"
+import { Checkbox } from "@/components/ui/checkbox"
 import {
   ArrowLeft,
   Play,
@@ -56,6 +58,8 @@ export default function ClientNormalizationPage() {
   const [selectedDatabaseId, setSelectedDatabaseId] = useState('')
   const [databases, setDatabases] = useState<ProjectDatabase[]>([])
   const [error, setError] = useState<string | null>(null)
+  const [processingMode, setProcessingMode] = useState<'single' | 'all'>('single')
+  const [useKpved, setUseKpved] = useState(false)
 
   useEffect(() => {
     if (clientId && projectId) {
@@ -92,28 +96,41 @@ export default function ClientNormalizationPage() {
   }
 
   const handleStart = async () => {
-    if (!selectedDatabaseId) {
+    if (processingMode === 'single' && !selectedDatabaseId) {
       setError('Пожалуйста, выберите базу данных')
       return
     }
 
-    const selectedDb = databases.find(db => db.id.toString() === selectedDatabaseId)
-    if (!selectedDb) {
-      setError('Выбранная база данных не найдена')
-      return
+    if (processingMode === 'single') {
+      const selectedDb = databases.find(db => db.id.toString() === selectedDatabaseId)
+      if (!selectedDb) {
+        setError('Выбранная база данных не найдена')
+        return
+      }
     }
 
     setIsLoading(true)
     setError(null)
     try {
+      const requestBody: any = {
+        use_kpved: useKpved,
+      }
+
+      if (processingMode === 'all') {
+        requestBody.all_active = true
+      } else {
+        const selectedDb = databases.find(db => db.id.toString() === selectedDatabaseId)
+        if (selectedDb) {
+          requestBody.database_path = selectedDb.file_path
+        }
+      }
+
       const response = await fetch(`/api/clients/${clientId}/projects/${projectId}/normalization/start`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          database_path: selectedDb.file_path
-        })
+        body: JSON.stringify(requestBody)
       })
 
       if (!response.ok) {
@@ -165,7 +182,10 @@ export default function ClientNormalizationPage() {
               Остановить
             </Button>
           ) : (
-            <Button onClick={handleStart} disabled={isLoading || !selectedDatabaseId}>
+            <Button 
+              onClick={handleStart} 
+              disabled={isLoading || (processingMode === 'single' && !selectedDatabaseId)}
+            >
               <Play className="mr-2 h-4 w-4" />
               {isLoading ? 'Запуск...' : 'Запустить нормализацию'}
             </Button>
@@ -182,54 +202,100 @@ export default function ClientNormalizationPage() {
               База данных источника
             </CardTitle>
             <CardDescription>
-              Выберите базу данных для нормализации из списка прикрепленных к проекту
+              Выберите режим обработки: конкретная база данных или все активные базы проекта
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
-            <div className="space-y-2">
-              <Label htmlFor="database-select">База данных</Label>
-              {databases.length === 0 ? (
-                <Alert>
-                  <AlertCircle className="h-4 w-4" />
-                  <AlertDescription>
-                    Нет доступных баз данных. Пожалуйста, добавьте базу данных на странице проекта.
-                  </AlertDescription>
-                </Alert>
-              ) : (
-                <>
-                  <Select value={selectedDatabaseId} onValueChange={setSelectedDatabaseId}>
-                    <SelectTrigger id="database-select">
-                      <SelectValue placeholder="Выберите базу данных" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {databases.map((db) => (
-                        <SelectItem key={db.id} value={db.id.toString()}>
-                          <div className="flex flex-col">
-                            <span className="font-medium">{db.name}</span>
-                            <span className="text-xs text-muted-foreground font-mono">{db.file_path}</span>
-                          </div>
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                  {selectedDatabaseId && databases.find(db => db.id.toString() === selectedDatabaseId) && (
-                    <div className="p-3 bg-muted rounded-md">
-                      <p className="text-sm font-medium">
-                        {databases.find(db => db.id.toString() === selectedDatabaseId)?.name}
-                      </p>
-                      <p className="text-xs text-muted-foreground font-mono mt-1">
-                        {databases.find(db => db.id.toString() === selectedDatabaseId)?.file_path}
-                      </p>
-                      {databases.find(db => db.id.toString() === selectedDatabaseId)?.description && (
-                        <p className="text-xs text-muted-foreground mt-1">
-                          {databases.find(db => db.id.toString() === selectedDatabaseId)?.description}
-                        </p>
-                      )}
+            {databases.length === 0 ? (
+              <Alert>
+                <AlertCircle className="h-4 w-4" />
+                <AlertDescription>
+                  Нет доступных баз данных. Пожалуйста, добавьте базу данных на странице проекта.
+                </AlertDescription>
+              </Alert>
+            ) : (
+              <>
+                <div className="space-y-3">
+                  <Label>Режим обработки</Label>
+                  <RadioGroup value={processingMode} onValueChange={(v) => setProcessingMode(v as 'single' | 'all')}>
+                    <div className="flex items-center space-x-2">
+                      <RadioGroupItem value="single" id="mode-single" />
+                      <Label htmlFor="mode-single" className="cursor-pointer font-normal">
+                        Обработать конкретную базу данных
+                      </Label>
                     </div>
-                  )}
-                </>
-              )}
-            </div>
+                    <div className="flex items-center space-x-2">
+                      <RadioGroupItem value="all" id="mode-all" />
+                      <Label htmlFor="mode-all" className="cursor-pointer font-normal">
+                        Обработать все активные базы данных проекта ({databases.length})
+                      </Label>
+                    </div>
+                  </RadioGroup>
+                </div>
+
+                {processingMode === 'single' && (
+                  <div className="space-y-2">
+                    <Label htmlFor="database-select">База данных</Label>
+                    <Select value={selectedDatabaseId} onValueChange={setSelectedDatabaseId}>
+                      <SelectTrigger id="database-select">
+                        <SelectValue placeholder="Выберите базу данных" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {databases.map((db) => (
+                          <SelectItem key={db.id} value={db.id.toString()}>
+                            <div className="flex flex-col">
+                              <span className="font-medium">{db.name}</span>
+                              <span className="text-xs text-muted-foreground font-mono">{db.file_path}</span>
+                            </div>
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    {selectedDatabaseId && databases.find(db => db.id.toString() === selectedDatabaseId) && (
+                      <div className="p-3 bg-muted rounded-md">
+                        <p className="text-sm font-medium">
+                          {databases.find(db => db.id.toString() === selectedDatabaseId)?.name}
+                        </p>
+                        <p className="text-xs text-muted-foreground font-mono mt-1">
+                          {databases.find(db => db.id.toString() === selectedDatabaseId)?.file_path}
+                        </p>
+                        {databases.find(db => db.id.toString() === selectedDatabaseId)?.description && (
+                          <p className="text-xs text-muted-foreground mt-1">
+                            {databases.find(db => db.id.toString() === selectedDatabaseId)?.description}
+                          </p>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {processingMode === 'all' && (
+                  <div className="p-3 bg-muted rounded-md">
+                    <p className="text-sm font-medium mb-2">Будут обработаны следующие базы данных:</p>
+                    <ul className="space-y-1">
+                      {databases.map((db) => (
+                        <li key={db.id} className="text-sm flex items-center gap-2">
+                          <Database className="h-3 w-3" />
+                          <span className="font-medium">{db.name}</span>
+                          <span className="text-xs text-muted-foreground font-mono">({db.file_path})</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                <div className="flex items-center space-x-2 pt-2 border-t">
+                  <Checkbox
+                    id="use-kpved"
+                    checked={useKpved}
+                    onCheckedChange={(checked) => setUseKpved(checked === true)}
+                  />
+                  <Label htmlFor="use-kpved" className="cursor-pointer font-normal">
+                    Классификация по КПВЭД после нормализации
+                  </Label>
+                </div>
+              </>
+            )}
             {error && (
               <Alert variant="destructive">
                 <AlertCircle className="h-4 w-4" />

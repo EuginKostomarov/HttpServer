@@ -3,16 +3,35 @@ package classification
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"httpserver/nomenclature"
 )
+
+// AIClassifierConfig конфигурация для AI классификатора
+type AIClassifierConfig struct {
+	MaxCategories      int // Максимальное количество категорий в списке (по умолчанию 15)
+	MaxCategoryNameLen int // Максимальная длина названия категории (по умолчанию 50)
+	EnableLogging      bool // Включить детальное логирование (по умолчанию true)
+}
 
 // AIClassifier классификатор категорий с использованием AI
 type AIClassifier struct {
 	aiClient       *nomenclature.AIClient
 	classifierTree *CategoryNode
+	categoryListCache string // Кэш для списка категорий
+	cacheMutex     sync.RWMutex
+	cacheHits      int64 // Счетчик попаданий в кэш
+	cacheMisses    int64 // Счетчик промахов кэша
+	config         AIClassifierConfig // Конфигурация
+	totalRequests  int64 // Общее количество запросов
+	totalLatency   time.Duration // Общее время выполнения запросов
+	perfMutex      sync.RWMutex // Мьютекс для метрик производительности
 }
 
 // Reuse CategoryNode from classifier.go
@@ -41,117 +60,118 @@ func NewAIClassifier(apiKey string, model string) *AIClassifier {
 			model = "GLM-4.5-Air" // Последний fallback
 		}
 	}
+	
+	// Загружаем конфигурацию из переменных окружения
+	config := loadConfigFromEnv()
+	
 	return &AIClassifier{
 		aiClient: nomenclature.NewAIClient(apiKey, model),
+		config:   config,
 	}
+}
+
+// loadConfigFromEnv загружает конфигурацию из переменных окружения
+func loadConfigFromEnv() AIClassifierConfig {
+	config := AIClassifierConfig{
+		MaxCategories:      15,
+		MaxCategoryNameLen: 50,
+		EnableLogging:      true,
+	}
+	
+	// Загружаем максимальное количество категорий
+	if maxCatStr := os.Getenv("AI_CLASSIFIER_MAX_CATEGORIES"); maxCatStr != "" {
+		if maxCat, err := strconv.Atoi(maxCatStr); err == nil && maxCat > 0 {
+			config.MaxCategories = maxCat
+		}
+	}
+	
+	// Загружаем максимальную длину названия категории
+	if maxLenStr := os.Getenv("AI_CLASSIFIER_MAX_NAME_LEN"); maxLenStr != "" {
+		if maxLen, err := strconv.Atoi(maxLenStr); err == nil && maxLen > 0 {
+			config.MaxCategoryNameLen = maxLen
+		}
+	}
+	
+	// Загружаем настройку логирования
+	if loggingStr := os.Getenv("AI_CLASSIFIER_ENABLE_LOGGING"); loggingStr != "" {
+		config.EnableLogging = strings.ToLower(loggingStr) == "true"
+	}
+	
+	return config
 }
 
 // SetClassifierTree устанавливает дерево классификатора
 func (ai *AIClassifier) SetClassifierTree(tree *CategoryNode) {
 	ai.classifierTree = tree
+	// Сбрасываем кэш при изменении дерева
+	ai.cacheMutex.Lock()
+	ai.categoryListCache = ""
+	ai.cacheMutex.Unlock()
 }
 
 // ClassifyWithAI определяет категорию товара с помощью AI
 func (ai *AIClassifier) ClassifyWithAI(request AIClassificationRequest) (*AIClassificationResponse, error) {
+	startTime := time.Now()
+	
 	// Подготавливаем промпт
 	prompt := ai.buildClassificationPrompt(request)
+	
+	// Логируем размер промпта для мониторинга оптимизаций
+	if ai.config.EnableLogging {
+		promptSize := len(prompt)
+		estimatedTokens := ai.estimateTokens(prompt)
+		log.Printf("[AIClassifier] Prompt size: %d bytes, estimated tokens: ~%d", promptSize, estimatedTokens)
+	}
 
 	// Вызываем AI
 	response, err := ai.callAI(prompt)
 	if err != nil {
+		// Обновляем метрики даже при ошибке
+		ai.updatePerformanceMetrics(time.Since(startTime))
 		return nil, fmt.Errorf("AI request failed: %w", err)
 	}
 
 	// Парсим ответ
-	return ai.parseAIResponse(response)
+	result, parseErr := ai.parseAIResponse(response)
+	
+	// Обновляем метрики производительности
+	latency := time.Since(startTime)
+	ai.updatePerformanceMetrics(latency)
+	
+	if ai.config.EnableLogging {
+		log.Printf("[AIClassifier] Classification completed in %v", latency)
+	}
+	
+	return result, parseErr
+}
+
+// updatePerformanceMetrics обновляет метрики производительности
+func (ai *AIClassifier) updatePerformanceMetrics(latency time.Duration) {
+	ai.perfMutex.Lock()
+	defer ai.perfMutex.Unlock()
+	
+	ai.totalRequests++
+	ai.totalLatency += latency
 }
 
 // buildClassificationPrompt строит промпт для классификации
 func (ai *AIClassifier) buildClassificationPrompt(request AIClassificationRequest) string {
 	classifierSummary := ai.summarizeClassifierTree()
 
-	return fmt.Sprintf(`Ты - эксперт по классификации товаров и услуг.
+	// Максимально упрощенный промпт для экономии токенов
+	// Используем компактный формат без лишних слов
+	desc := ""
+	if request.Description != "" {
+		desc = " " + request.Description
+	}
+	
+	return fmt.Sprintf(`Классифицируй: %s%s
 
-ТВОЯ ЗАДАЧА:
-Определить наиболее подходящий путь категории для объекта из предложенного классификатора.
+Категории: %s
 
-ОБЪЕКТ:
-Название: %s
-Описание: %s
-
-КЛАССИФИКАТОР КАТЕГОРИЙ:
-%s
-
-ОСНОВНЫЕ ПРИНЦИПЫ КЛАССИФИКАЦИИ:
-
-1. РАЗГРАНИЧЕНИЕ ТОВАР/УСЛУГА:
-   - ТОВАРЫ: физические объекты, материалы, оборудование, изделия, комплектующие
-   - УСЛУГИ: работы, действия, консультации, техническое обслуживание, выполнение работ
-
-2. КРИТИЧЕСКИЕ ПРИЗНАКИ ТОВАРА:
-   - Наличие физической формы и материальной сущности
-   - Возможность поставки, хранения, инвентаризации
-   - Указание конкретных характеристик (размеры, марки, модели, артикулы)
-   - Наличие технических параметров (диаметр, длина, вес, материал)
-
-3. ПРАВИЛА ВЫБОРА КАТЕГОРИИ:
-   - Выбирай наиболее специфичный (детальный) путь
-   - Путь должен быть полным (от корня до листа)
-   - Если не уверен - используй более общий путь
-   - Учитывай назначение и материал объекта
-
-4. ТИПИЧНЫЕ ОШИБКИ (ИЗБЕГАТЬ):
-   - НЕ классифицировать оборудование/приборы как услуги по испытаниям
-   - НЕ классифицировать материалы/комплектующие как прочие услуги
-   - НЕ классифицировать кабели как печатные платы
-   - НЕ классифицировать строительные элементы как прочие изделия
-   - НЕ классифицировать датчики/преобразователи как услуги
-   - НЕ классифицировать сэндвич-панели (isowall, sandwich panel) как изделия из гипса/бетона
-
-5. ПРАВИЛА КЛАССИФИКАЦИИ СТРОИТЕЛЬНЫХ МАТЕРИАЛОВ:
-   - СЭНДВИЧ-ПАНЕЛИ (металлическая обшивка + утеплитель):
-     * Содержат "isowall", "сэндвич", "sandwich", "isopan" → 25.11.1 (Металлические конструкции)
-     * НЕ относятся к 23.69.19 (Изделия из гипса, бетона или цемента)
-     * Это многослойные конструкции с металлической обшивкой и наполнителем
-   - ИЗДЕЛИЯ ИЗ МИНЕРАЛЬНЫХ МАТЕРИАЛОВ:
-     * Только если основной материал гипс/бетон/цемент
-     * Сэндвич-панели с минеральной ватой НЕ относятся сюда
-
-6. ПРИМЕРЫ ПРАВИЛЬНОЙ КЛАССИФИКАЦИИ:
-   - "фасонные элементы для панелей" → строительные конструкции, НЕ услуги
-   - "преобразователь давления" → измерительные приборы, НЕ услуги по испытаниям
-   - "контрольный кабель" → кабели, НЕ печатные платы
-   - "датчик давления" → измерительные приборы, НЕ услуги
-   - "панель isowall box" → металлические конструкции (25.11.1), НЕ изделия из гипса (23.69.19)
-   - "сэндвич панель" → металлические конструкции (25.11.1), НЕ изделия из гипса (23.69.19)
-
-КОГДА ВИДИШЬ ТОВАР (физический объект):
-- Исключи категории услуг (разделы 33-99, особенно 71.20.1, 96.09.1)
-- Найди наиболее специфическую категорию оборудования/материалов
-- Обрати внимание на технические характеристики (марки, модели, размеры)
-- Если видишь марку/модель (например: AKS, HELUKABEL, MQ) - это точно товар
-- Если видишь технические параметры (давление, диаметр, длина) - это товар
-
-КОГДА ВИДИШЬ УСЛУГУ (действие, работу):
-- Убедись, что это действительно услуга, а не описание товара
-- Проверь наличие признаков выполнения работ (монтаж, установка, ремонт, испытание)
-- Если в названии есть марка/модель товара - это НЕ услуга, а товар
-
-ФОРМАТ ОТВЕТА - ТОЛЬКО JSON:
-{
-    "category_path": ["Уровень1", "Уровень2", "Уровень3"],
-    "confidence": 0.95,
-    "reasoning": "Краткое обоснование выбора",
-    "alternatives": [["Альтернативный", "Путь"]]
-}
-
-ВАЖНО:
-- Отвечай ТОЛЬКО в указанном JSON формате
-- Не добавляй никакого текста кроме JSON
-- Убедись что путь существует в классификаторе
-- Проверь соответствие выбранного пути физическим характеристикам объекта`,
+JSON: {"category_path": ["Категория"], "confidence": 0.9, "reasoning": "кратко"}`,
 		request.ItemName,
-		request.Description,
+		desc,
 		classifierSummary,
 	)
 }
@@ -162,54 +182,91 @@ func (ai *AIClassifier) summarizeClassifierTree() string {
 		return "Классификатор не загружен"
 	}
 
-	// Ограничиваем глубину для экономии токенов (макс 3 уровня)
-	return ai.traverseTreeSummary(ai.classifierTree, 0, 3)
+	// Используем кэш для списка категорий (он не меняется между запросами)
+	ai.cacheMutex.RLock()
+	if ai.categoryListCache != "" {
+		cached := ai.categoryListCache
+		ai.cacheMutex.RUnlock()
+		
+		// Инкрементируем счетчик попаданий (нужен Lock для записи)
+		ai.cacheMutex.Lock()
+		ai.cacheHits++
+		hits := ai.cacheHits
+		misses := ai.cacheMisses
+		ai.cacheMutex.Unlock()
+		
+		if ai.config.EnableLogging {
+			log.Printf("[AIClassifier] Cache HIT: category list reused (hits: %d, misses: %d)", hits, misses)
+		}
+		return cached
+	}
+	ai.cacheMutex.RUnlock()
+
+	// Используем компактный формат списка категорий вместо дерева
+	// Ограничиваем количество категорий из конфигурации
+	categoryList := ai.buildCompactCategoryList(ai.config.MaxCategories)
+	
+	// Сохраняем в кэш
+	ai.cacheMutex.Lock()
+	ai.categoryListCache = categoryList
+	ai.cacheMisses++
+	hits := ai.cacheHits
+	misses := ai.cacheMisses
+	ai.cacheMutex.Unlock()
+	
+	if ai.config.EnableLogging {
+		log.Printf("[AIClassifier] Cache MISS: category list generated (hits: %d, misses: %d)", hits, misses)
+	}
+	return categoryList
 }
 
-// traverseTreeSummary обходит дерево и создает текстовое представление
-func (ai *AIClassifier) traverseTreeSummary(node *CategoryNode, currentLevel, maxLevel int) string {
-	if node == nil || currentLevel >= maxLevel {
-		return ""
+// buildCompactCategoryList создает компактный список категорий (только названия, через запятую)
+func (ai *AIClassifier) buildCompactCategoryList(maxCategories int) string {
+	if ai.classifierTree == nil || len(ai.classifierTree.Children) == 0 {
+		return "Нет категорий"
 	}
 
-	var result strings.Builder
-	indent := strings.Repeat("  ", currentLevel)
-	result.WriteString(fmt.Sprintf("%s- %s (ID: %s)\n", indent, node.Name, node.ID))
+	var categories []string
+	max := maxCategories
+	if len(ai.classifierTree.Children) < max {
+		max = len(ai.classifierTree.Children)
+	}
 
-	// Рекурсивно обходим детей
-	for i := range node.Children {
-		childSummary := ai.traverseTreeSummary(&node.Children[i], currentLevel+1, maxLevel)
-		if childSummary != "" {
-			result.WriteString(childSummary)
+	// Берем только первые maxCategories категорий
+	// Обрезаем длинные названия для экономии токенов
+	maxLen := ai.config.MaxCategoryNameLen
+	for i := 0; i < max; i++ {
+		name := ai.classifierTree.Children[i].Name
+		// Обрезаем слишком длинные названия
+		if len(name) > maxLen {
+			name = name[:maxLen-3] + "..."
 		}
+		categories = append(categories, name)
 	}
 
-	return result.String()
+	result := strings.Join(categories, ", ")
+	
+	// Если категорий больше, указываем это кратко
+	if len(ai.classifierTree.Children) > max {
+		result += fmt.Sprintf(" ... (+%d)", len(ai.classifierTree.Children)-max)
+	}
+
+	return result
 }
 
 // callAI вызывает AI API
 func (ai *AIClassifier) callAI(prompt string) (string, error) {
-	// Используем GetCompletion из AIClient
-	// Но сначала нужно проверить, есть ли такой метод
-	// Если нет, используем ProcessProduct с кастомным промптом
+	// Упрощенный системный промпт для экономии токенов
+	systemPrompt := `Классифицируй товары/услуги. ТОВАРЫ=объекты, УСЛУГИ=работы. JSON формат.`
+	
+	// Логируем размер системного промпта
+	if ai.config.EnableLogging {
+		systemPromptSize := len(systemPrompt)
+		systemPromptTokens := ai.estimateTokens(systemPrompt)
+		log.Printf("[AIClassifier] System prompt size: %d bytes, estimated tokens: ~%d", systemPromptSize, systemPromptTokens)
+	}
 
-	// Создаем системный промпт
-	systemPrompt := `Ты - эксперт по классификации товаров и услуг. 
-
-ВАЖНО: 
-- Физические товары (материалы, оборудование, изделия) НЕ могут быть услугами
-- Если видишь марку, модель, технические характеристики - это товар
-- Услуги описывают действия, работы, консультации, а не физические объекты
-
-Отвечай только в формате JSON.`
-
-	// Используем ProcessProduct, но нам нужен другой формат ответа
-	// Создадим временный метод или используем существующий
-
-	// Для простоты используем прямой вызов через GetCompletion если доступен
-	// Иначе используем ProcessProduct и парсим ответ
-
-	// Пока используем упрощенный подход - вызываем через стандартный метод
+	// Вызываем AI через стандартный метод
 	result, err := ai.aiClient.GetCompletion(systemPrompt, prompt)
 	if err != nil {
 		return "", fmt.Errorf("AI API call failed: %w", err)
@@ -247,6 +304,48 @@ func (ai *AIClassifier) parseAIResponse(response string) (*AIClassificationRespo
 	}
 
 	return &aiResponse, nil
+}
+
+// estimateTokens приблизительно оценивает количество токенов в тексте
+// Используется простая эвристика: ~4 символа на токен для русского текста
+func (ai *AIClassifier) estimateTokens(text string) int {
+	// Приблизительная оценка: для русского текста ~3-4 символа на токен
+	// Для английского ~4 символа на токен
+	// Берем среднее значение
+	charCount := len([]rune(text))
+	return charCount / 3
+}
+
+// GetCacheStats возвращает статистику использования кэша
+func (ai *AIClassifier) GetCacheStats() (hits, misses int64) {
+	ai.cacheMutex.RLock()
+	defer ai.cacheMutex.RUnlock()
+	return ai.cacheHits, ai.cacheMisses
+}
+
+// GetPerformanceStats возвращает статистику производительности
+func (ai *AIClassifier) GetPerformanceStats() (totalRequests int64, avgLatency time.Duration) {
+	ai.perfMutex.RLock()
+	defer ai.perfMutex.RUnlock()
+	
+	if ai.totalRequests > 0 {
+		avgLatency = ai.totalLatency / time.Duration(ai.totalRequests)
+	}
+	return ai.totalRequests, avgLatency
+}
+
+// GetConfig возвращает текущую конфигурацию
+func (ai *AIClassifier) GetConfig() AIClassifierConfig {
+	return ai.config
+}
+
+// SetConfig устанавливает новую конфигурацию (сбрасывает кэш)
+func (ai *AIClassifier) SetConfig(config AIClassifierConfig) {
+	ai.config = config
+	// Сбрасываем кэш при изменении конфигурации
+	ai.cacheMutex.Lock()
+	ai.categoryListCache = ""
+	ai.cacheMutex.Unlock()
 }
 
 // CodeExists проверяет существование пути в классификаторе

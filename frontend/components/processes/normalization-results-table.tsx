@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useCallback, useRef, memo } from 'react'
+import { useState, useEffect, useCallback, useRef, memo, useMemo } from 'react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   Table,
@@ -26,7 +26,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Pagination } from '@/components/ui/pagination'
-import { ChevronDown, ChevronUp, RefreshCw } from 'lucide-react'
+import { ChevronDown, ChevronUp, RefreshCw, ArrowUpDown, ArrowUp, ArrowDown } from 'lucide-react'
 
 interface Group {
   normalized_name: string
@@ -258,6 +258,44 @@ export function NormalizationResultsTable({ isRunning, database }: Normalization
   const [total, setTotal] = useState(0)
   const [limit, setLimit] = useState(10) // Показываем первые 10 групп на странице процессов
 
+  // Состояние для сортировки
+  const [sortKey, setSortKey] = useState<string | null>(null)
+  const [sortDirection, setSortDirection] = useState<'asc' | 'desc' | null>(null)
+
+  // Добавляем состояние для clientId, projectId и dbId
+  const [clientId, setClientId] = useState<number | null>(null)
+  const [projectId, setProjectId] = useState<number | null>(null)
+  const [dbId, setDbId] = useState<number | null>(null)
+
+  // Находим клиента и проект по базе данных при монтировании и при смене database
+  useEffect(() => {
+    if (database) {
+      fetch(`/api/databases/find-project?file_path=${encodeURIComponent(database)}`)
+        .then(res => res.ok ? res.json() : null)
+        .then(data => {
+          if (data) {
+            setClientId(data.client_id)
+            setProjectId(data.project_id)
+            setDbId(data.db_id || null)
+          } else {
+            setClientId(null)
+            setProjectId(null)
+            setDbId(null)
+          }
+        })
+        .catch(err => {
+          console.error('Failed to find project:', err)
+          setClientId(null)
+          setProjectId(null)
+          setDbId(null)
+        })
+    } else {
+      setClientId(null)
+      setProjectId(null)
+      setDbId(null)
+    }
+  }, [database]) // Добавляем database в зависимости
+
   const fetchGroups = useCallback(async () => {
     setIsLoading(true)
     try {
@@ -267,7 +305,17 @@ export function NormalizationResultsTable({ isRunning, database }: Normalization
         include_ai: 'true',
       })
 
-      const response = await fetch(`/api/normalization/groups?${params}`)
+      // Если есть clientId, projectId и dbId, используем API проекта с фильтрацией по базе
+      let apiUrl = '/api/normalization/groups'
+      if (clientId && projectId && dbId) {
+        apiUrl = `/api/clients/${clientId}/projects/${projectId}/normalization/groups`
+        params.append('db_id', dbId.toString())
+      } else if (database) {
+        // Fallback: используем старый API с параметром database
+        params.append('database', database)
+      }
+
+      const response = await fetch(`${apiUrl}?${params}`)
       
       if (!response.ok) {
         throw new Error('Не удалось загрузить группы')
@@ -283,7 +331,7 @@ export function NormalizationResultsTable({ isRunning, database }: Normalization
     } finally {
       setIsLoading(false)
     }
-  }, [currentPage, limit])
+  }, [currentPage, limit, database, clientId, projectId, dbId]) // Добавляем dbId в зависимости
 
   const fetchGroupItems = useCallback(async (normalizedName: string, category: string) => {
     const groupKey = `${normalizedName}|${category}`
@@ -369,7 +417,7 @@ export function NormalizationResultsTable({ isRunning, database }: Normalization
       const interval = setInterval(fetchGroups, 3000)
       return () => clearInterval(interval)
     }
-  }, [fetchGroups, isRunning])
+  }, [fetchGroups, isRunning]) // fetchGroups уже включает все зависимости
 
   const toggleGroupExpansion = useCallback((normalizedName: string, category: string) => {
     const groupKey = `${normalizedName}|${category}`
@@ -390,6 +438,87 @@ export function NormalizationResultsTable({ isRunning, database }: Normalization
     const items = groupItems.get(groupKey) || []
     return items.reduce((count, item) => count + (item.attributes?.length || 0), 0)
   }, [groupItems])
+
+  // Функция для обработки сортировки
+  const handleSort = (key: string) => {
+    let newDirection: 'asc' | 'desc' | null = 'asc'
+    if (sortKey === key) {
+      if (sortDirection === 'asc') {
+        newDirection = 'desc'
+      } else if (sortDirection === 'desc') {
+        newDirection = null
+      }
+    }
+
+    setSortKey(newDirection ? key : null)
+    setSortDirection(newDirection)
+  }
+
+  // Сортировка данных
+  const sortedGroups = useMemo(() => {
+    if (!sortKey || !sortDirection) return groups
+
+    return [...groups].sort((a, b) => {
+      let aValue: any
+      let bValue: any
+
+      switch (sortKey) {
+        case 'normalized_name':
+          aValue = a.normalized_name
+          bValue = b.normalized_name
+          break
+        case 'category':
+          aValue = a.category
+          bValue = b.category
+          break
+        case 'kpved_code':
+          aValue = a.kpved_code || ''
+          bValue = b.kpved_code || ''
+          break
+        case 'merged_count':
+          aValue = a.merged_count
+          bValue = b.merged_count
+          break
+        case 'kpved_confidence':
+          aValue = a.kpved_confidence ?? 0
+          bValue = b.kpved_confidence ?? 0
+          break
+        default:
+          return 0
+      }
+
+      // Обработка null/undefined
+      if (aValue == null && bValue == null) return 0
+      if (aValue == null) return 1
+      if (bValue == null) return -1
+
+      // Сравнение значений
+      let comparison = 0
+      if (typeof aValue === 'string' && typeof bValue === 'string') {
+        comparison = aValue.localeCompare(bValue, 'ru-RU', { numeric: true, sensitivity: 'base' })
+      } else if (typeof aValue === 'number' && typeof bValue === 'number') {
+        comparison = aValue - bValue
+      } else {
+        comparison = String(aValue).localeCompare(String(bValue), 'ru-RU', { numeric: true })
+      }
+
+      return sortDirection === 'asc' ? comparison : -comparison
+    })
+  }, [groups, sortKey, sortDirection])
+
+  // Функция для получения иконки сортировки
+  const getSortIcon = (key: string) => {
+    if (sortKey !== key) {
+      return <ArrowUpDown className="ml-2 h-3 w-3 opacity-50" />
+    }
+    if (sortDirection === 'asc') {
+      return <ArrowUp className="ml-2 h-3 w-3" />
+    }
+    if (sortDirection === 'desc') {
+      return <ArrowDown className="ml-2 h-3 w-3" />
+    }
+    return <ArrowUpDown className="ml-2 h-3 w-3 opacity-50" />
+  }
 
   const handlePageSizeChange = (newLimit: string) => {
     setLimit(Number(newLimit))
@@ -439,7 +568,7 @@ export function NormalizationResultsTable({ isRunning, database }: Normalization
           <div>
             <CardTitle>Результаты нормализации</CardTitle>
             <CardDescription>
-              Показано {groups.length} из {total.toLocaleString()} групп
+              Показано {sortedGroups.length} из {total.toLocaleString()} групп
             </CardDescription>
           </div>
           {isRunning && (
@@ -455,15 +584,51 @@ export function NormalizationResultsTable({ isRunning, database }: Normalization
             <TableHeader className="sticky top-0 bg-background z-10">
               <TableRow>
                 <TableHead className="w-[50px]"></TableHead>
-                <TableHead>Нормализованное имя</TableHead>
-                <TableHead>Категория</TableHead>
-                <TableHead>КПВЭД</TableHead>
-                <TableHead className="text-center">Объединено</TableHead>
+                <TableHead>
+                  <Button
+                    variant="ghost"
+                    className="h-8 px-2 hover:bg-transparent"
+                    onClick={() => handleSort('normalized_name')}
+                  >
+                    Нормализованное имя
+                    {getSortIcon('normalized_name')}
+                  </Button>
+                </TableHead>
+                <TableHead>
+                  <Button
+                    variant="ghost"
+                    className="h-8 px-2 hover:bg-transparent"
+                    onClick={() => handleSort('category')}
+                  >
+                    Категория
+                    {getSortIcon('category')}
+                  </Button>
+                </TableHead>
+                <TableHead>
+                  <Button
+                    variant="ghost"
+                    className="h-8 px-2 hover:bg-transparent"
+                    onClick={() => handleSort('kpved_code')}
+                  >
+                    КПВЭД
+                    {getSortIcon('kpved_code')}
+                  </Button>
+                </TableHead>
+                <TableHead className="text-center">
+                  <Button
+                    variant="ghost"
+                    className="h-8 px-2 hover:bg-transparent"
+                    onClick={() => handleSort('merged_count')}
+                  >
+                    Объединено
+                    {getSortIcon('merged_count')}
+                  </Button>
+                </TableHead>
                 <TableHead className="text-center">Атрибутов</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
-              {groups.map((group) => {
+              {sortedGroups.map((group) => {
                 const groupKey = `${group.normalized_name}|${group.category}`
                 return (
                   <GroupRow

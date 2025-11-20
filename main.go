@@ -19,6 +19,11 @@ import (
 func main() {
 	log.Println("Запуск 1C HTTP Server...")
 
+	// Создаем папку data/uploads если её нет
+	if _, err := server.EnsureUploadsDirectory("."); err != nil {
+		log.Printf("Предупреждение: не удалось создать папку data/uploads: %v", err)
+	}
+
 	// Загружаем конфигурацию
 	config, err := server.LoadConfig()
 	if err != nil {
@@ -86,8 +91,8 @@ func main() {
 
 	// Фоновое сохранение метрик производительности в БД
 	go func() {
-		// Ждем 5 минут перед первым сохранением (чтобы накопились данные)
-		time.Sleep(5 * time.Minute)
+		// Ждем 10 секунд перед первым сохранением (чтобы сервер успел инициализироваться)
+		time.Sleep(10 * time.Second)
 
 		// Периодически очищаем старые метрики (раз в день)
 		cleanupTicker := time.NewTicker(24 * time.Hour)

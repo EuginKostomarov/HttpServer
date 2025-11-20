@@ -8,8 +8,10 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { Database } from "lucide-react"
+import { Database, RefreshCw, CheckCircle2 } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
+import { Button } from "@/components/ui/button"
+import { cn } from "@/lib/utils"
 
 interface DatabaseInfo {
   name: string
@@ -148,7 +150,7 @@ export function DatabaseSelector({
   }
 
   return (
-    <div className={className}>
+    <div className={cn("flex items-center gap-2", className)}>
       <Select
         value={value}
         onValueChange={onChange}
@@ -156,22 +158,29 @@ export function DatabaseSelector({
       >
         <SelectTrigger className="w-full min-w-[200px]">
           <div className="flex items-center gap-2">
-            <Database className="h-4 w-4" />
+            <Database className={cn("h-4 w-4", loading && "animate-pulse")} />
             <SelectValue placeholder={loading ? "Загрузка..." : placeholder} />
           </div>
         </SelectTrigger>
         <SelectContent>
           {databases.length === 0 ? (
             <SelectItem value="no-database" disabled>
-              Нет доступных баз данных
+              <div className="flex items-center gap-2 text-muted-foreground">
+                <Database className="h-4 w-4" />
+                <span>Нет доступных баз данных</span>
+              </div>
             </SelectItem>
           ) : (
             databases.map((db) => (
               <SelectItem key={db.name} value={db.name}>
-                <div className="flex items-center gap-2">
-                  <span>{db.name}</span>
+                <div className="flex items-center justify-between gap-3 w-full">
+                  <div className="flex items-center gap-2 flex-1 min-w-0">
+                    <Database className="h-4 w-4 text-muted-foreground flex-shrink-0" />
+                    <span className="truncate">{db.name}</span>
+                  </div>
                   {db.isCurrent && (
-                    <Badge variant="secondary" className="text-xs">
+                    <Badge variant="default" className="text-xs flex items-center gap-1 flex-shrink-0">
+                      <CheckCircle2 className="h-3 w-3" />
                       Текущая
                     </Badge>
                   )}
@@ -181,6 +190,16 @@ export function DatabaseSelector({
           )}
         </SelectContent>
       </Select>
+      <Button
+        variant="outline"
+        size="icon"
+        onClick={() => fetchDatabases(true)}
+        disabled={loading}
+        className="h-10 w-10"
+        title="Обновить список баз данных"
+      >
+        <RefreshCw className={cn("h-4 w-4", loading && "animate-spin")} />
+      </Button>
     </div>
   )
 }

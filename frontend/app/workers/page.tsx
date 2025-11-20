@@ -75,6 +75,7 @@ export default function WorkersPage() {
   const [refreshingModels, setRefreshingModels] = useState<Record<string, boolean>>({})
   const [savingApiKey, setSavingApiKey] = useState<Record<string, boolean>>({})
   const successTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+  const refreshingRef = useRef<Record<string, boolean>>({}) // Ref для отслеживания активных обновлений
 
   useEffect(() => {
     fetchConfig()
@@ -161,7 +162,8 @@ export default function WorkersPage() {
       }))
       
       // Если подключение успешно, автоматически обновляем список моделей
-      if (data.connected && providerName === 'arliai') {
+      // Только если еще не обновляется
+      if (data.connected && providerName === 'arliai' && !refreshingRef.current[providerName]) {
         setTimeout(() => {
           refreshModels(providerName)
         }, 500)
@@ -183,6 +185,11 @@ export default function WorkersPage() {
   }
 
   const refreshModels = async (providerName: string) => {
+    // Защита от повторных вызовов
+    if (refreshingRef.current[providerName]) {
+      return
+    }
+    
     if (!config) {
       setError('Конфигурация не загружена')
       return
@@ -194,6 +201,7 @@ export default function WorkersPage() {
       return
     }
 
+    refreshingRef.current[providerName] = true
     setRefreshingModels(prev => ({ ...prev, [providerName]: true }))
     setError(null)
 
@@ -211,8 +219,20 @@ export default function WorkersPage() {
       const data = await response.json()
       
       if (data.success) {
-        // После получения моделей перезагружаем конфигурацию
-        await fetchConfig()
+        // Обновляем конфигурацию напрямую, не вызывая fetchConfig (чтобы избежать бесконечного цикла)
+        setConfig((prev) => {
+          if (!prev) return prev
+          return {
+            ...prev,
+            providers: {
+              ...prev.providers,
+              [providerName]: {
+                ...prev.providers[providerName],
+                available_models: data.data?.models || [],
+              },
+            },
+          }
+        })
         
         if (data.data?.models && data.data.models.length > 0) {
           setSuccess(`Список моделей обновлен (найдено моделей: ${data.data.models.length})`)
@@ -243,6 +263,7 @@ export default function WorkersPage() {
         // Статус подключения уже установлен в testAPIKey
       }
     } finally {
+      refreshingRef.current[providerName] = false
       setRefreshingModels(prev => ({ ...prev, [providerName]: false }))
     }
   }
@@ -294,7 +315,8 @@ export default function WorkersPage() {
       })
       
       // Проверяем статус подключения для Arliai после небольшой задержки
-      if (data.providers?.arliai) {
+      // Только если еще не проверяли (избегаем бесконечных циклов)
+      if (data.providers?.arliai && !apiKeyStatus['arliai']?.testing && !apiKeyStatus['arliai']?.connected) {
         setTimeout(() => {
           testAPIKey('arliai')
         }, 100)
@@ -469,8 +491,9 @@ export default function WorkersPage() {
             // Используем функциональное обновление для получения актуального значения
             setApiKeyStatus(prev => {
               const status = prev[providerName]
-              if (status?.connected) {
+              if (status?.connected && !refreshingRef.current[providerName]) {
                 // Явно вызываем обновление моделей после успешной проверки
+                // Только если еще не обновляется
                 refreshModels(providerName).catch(err => {
                   console.error('Error refreshing models after API key save:', err)
                 })

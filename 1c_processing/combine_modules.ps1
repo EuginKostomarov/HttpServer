@@ -22,3 +22,4 @@ Write-Host "Размер файла: $((Get-Item $ModulePath).Length) байт" 
 
 
 
+

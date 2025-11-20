@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { getBackendUrl } from '@/lib/api-config'
 
-const API_BASE = process.env.BACKEND_URL || 'http://localhost:9999'
+const API_BASE = getBackendUrl()
 
 export async function GET(
   request: NextRequest,

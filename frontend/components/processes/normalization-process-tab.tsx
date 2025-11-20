@@ -11,6 +11,7 @@ import { Play, Square, RefreshCw, Clock, Zap } from 'lucide-react'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Label } from '@/components/ui/label'
+import { apiRequest, formatError } from '@/lib/api-utils'
 
 interface NormalizationProcessTabProps {
   database: string
@@ -45,19 +46,62 @@ export function NormalizationProcessTab({ database }: NormalizationProcessTabPro
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [useKpved, setUseKpved] = useState(false)
+  const [useOkpd2, setUseOkpd2] = useState(false)
+
+  const [clientId, setClientId] = useState<number | null>(null)
+  const [projectId, setProjectId] = useState<number | null>(null)
+
+  // Находим клиента и проект по базе данных при монтировании
+  useEffect(() => {
+    if (database) {
+      fetch(`/api/databases/find-project?file_path=${encodeURIComponent(database)}`)
+        .then(res => res.ok ? res.json() : null)
+        .then(data => {
+          if (data) {
+            setClientId(data.client_id)
+            setProjectId(data.project_id)
+          }
+        })
+        .catch(err => console.error('Failed to find project:', err))
+    }
+  }, [database])
 
   const fetchStatus = useCallback(async () => {
     try {
-      const response = await fetch('/api/normalization/status', {
-        cache: 'no-store',
-      })
+      // Если есть клиент и проект, используем их API
+      let response: Response
+      if (clientId && projectId) {
+        response = await fetch(`/api/clients/${clientId}/projects/${projectId}/normalization/status`, {
+          cache: 'no-store',
+        })
+      } else {
+        response = await fetch('/api/normalization/status', {
+          cache: 'no-store',
+        })
+      }
       
       if (!response.ok) {
         throw new Error('Не удалось получить статус')
       }
       
       const data = await response.json()
-      setStatus(data)
+      // Преобразуем формат ответа для единообразия
+      setStatus({
+        isRunning: data.isRunning || data.is_running || false,
+        progress: data.progress || 0,
+        processed: data.processed || 0,
+        total: data.total || 0,
+        success: data.success,
+        errors: data.errors,
+        currentStep: data.currentStep || data.current_step || 'Не запущено',
+        logs: data.logs || [],
+        startTime: data.startTime || data.start_time,
+        elapsedTime: data.elapsedTime || data.elapsed_time,
+        rate: data.rate,
+        kpvedClassified: data.kpvedClassified || data.kpved_classified,
+        kpvedTotal: data.kpvedTotal || data.kpved_total,
+        kpvedProgress: data.kpvedProgress || data.kpved_progress,
+      })
       setError(null)
     } catch (err) {
       console.error('Error fetching normalization status:', err)
@@ -65,7 +109,7 @@ export function NormalizationProcessTab({ database }: NormalizationProcessTabPro
         setError('Не удалось подключиться к серверу')
       }
     }
-  }, [status.isRunning])
+  }, [status.isRunning, clientId, projectId])
 
   useEffect(() => {
     // Первоначальная загрузка
@@ -86,30 +130,58 @@ export function NormalizationProcessTab({ database }: NormalizationProcessTabPro
     setError(null)
     
     try {
-      const response = await fetch('/api/normalization/start', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          use_ai: false,
-          min_confidence: 0.8,
-          database: database,
-          use_kpved: useKpved,
-        }),
-      })
-
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({ error: 'Неизвестная ошибка' }))
-        throw new Error(errorData.error || 'Не удалось запустить нормализацию')
+      // Если указана база данных, сначала находим клиента и проект
+      let clientId: number | null = null
+      let projectId: number | null = null
+      
+      if (database) {
+        try {
+          const findData = await apiRequest<{ client_id: number; project_id: number }>(
+            `/api/databases/find-project?file_path=${encodeURIComponent(database)}`
+          )
+          clientId = findData.client_id
+          projectId = findData.project_id
+        } catch (err) {
+          console.error('Failed to find project for database:', err)
+        }
       }
 
-      // Обновляем статус после запуска
-      setTimeout(() => {
-        fetchStatus()
-      }, 500)
+      // Если нашли клиента и проект, используем новый API
+      if (clientId && projectId) {
+        await apiRequest(`/api/clients/${clientId}/projects/${projectId}/normalization/start`, {
+          method: 'POST',
+          body: JSON.stringify({
+            database_path: database,
+            all_active: false,
+            use_kpved: useKpved,
+            use_okpd2: useOkpd2,
+          }),
+        })
+
+        // Обновляем статус после запуска
+        setTimeout(() => {
+          fetchStatus()
+        }, 500)
+      } else {
+        // Используем старый API, если не нашли клиента/проекта
+        await apiRequest('/api/normalization/start', {
+          method: 'POST',
+          body: JSON.stringify({
+            use_ai: false,
+            min_confidence: 0.8,
+            database: database,
+            use_kpved: useKpved,
+            use_okpd2: useOkpd2,
+          }),
+        })
+
+        // Обновляем статус после запуска
+        setTimeout(() => {
+          fetchStatus()
+        }, 500)
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Ошибка запуска нормализации')
+      setError(formatError(err))
     } finally {
       setIsLoading(false)
     }
@@ -219,15 +291,32 @@ export function NormalizationProcessTab({ database }: NormalizationProcessTabPro
                 )}
               </>
             )}
-            {status.rate && status.rate > 0 && (
+            {(status.rate !== undefined && status.rate > 0) && (
               <div className="space-y-1">
                 <div className="text-sm text-muted-foreground flex items-center gap-1">
                   <Zap className="h-3 w-3" />
                   Скорость
                 </div>
-                <div className="text-2xl font-bold">
-                  {status.rate.toFixed(1)}/сек
+                <div className="text-2xl font-bold text-blue-600">
+                  {status.rate >= 1 
+                    ? `${status.rate.toFixed(1)}/сек`
+                    : `${(status.rate * 60).toFixed(1)}/мин`
+                  }
                 </div>
+                {status.processed > 0 && status.total > 0 && status.rate > 0 && (
+                  <div className="text-xs text-muted-foreground">
+                    {(() => {
+                      const remaining = (status.total - status.processed) / status.rate
+                      if (remaining < 60) {
+                        return `~${Math.ceil(remaining)}с осталось`
+                      } else if (remaining < 3600) {
+                        return `~${Math.ceil(remaining / 60)}мин осталось`
+                      } else {
+                        return `~${Math.ceil(remaining / 3600)}ч осталось`
+                      }
+                    })()}
+                  </div>
+                )}
               </div>
             )}
             {status.elapsedTime && (
@@ -264,23 +353,45 @@ export function NormalizationProcessTab({ database }: NormalizationProcessTabPro
 
           {/* Настройки перед запуском */}
           {!status.isRunning && (
-            <div className="space-y-2 pt-4 border-t">
-              <div className="flex items-center space-x-2">
-                <Checkbox
-                  id="use-kpved"
-                  checked={useKpved}
-                  onCheckedChange={(checked) => setUseKpved(checked === true)}
-                />
-                <Label
-                  htmlFor="use-kpved"
-                  className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 cursor-pointer"
-                >
-                  Классификация по КПВЭД
-                </Label>
+            <div className="space-y-4 pt-4 border-t">
+              <div className="text-sm font-medium text-muted-foreground mb-2">
+                Дополнительные классификаторы
               </div>
-              <p className="text-xs text-muted-foreground ml-6">
-                После нормализации выполнить автоматическую классификацию по классификатору КПВЭД
-              </p>
+              <div className="space-y-3">
+                <div className="flex items-center space-x-2">
+                  <Checkbox
+                    id="use-kpved"
+                    checked={useKpved}
+                    onCheckedChange={(checked) => setUseKpved(checked === true)}
+                  />
+                  <Label
+                    htmlFor="use-kpved"
+                    className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 cursor-pointer"
+                  >
+                    Классификация по КПВЭД
+                  </Label>
+                </div>
+                <p className="text-xs text-muted-foreground ml-6">
+                  После нормализации выполнить автоматическую классификацию по классификатору КПВЭД
+                </p>
+                
+                <div className="flex items-center space-x-2">
+                  <Checkbox
+                    id="use-okpd2"
+                    checked={useOkpd2}
+                    onCheckedChange={(checked) => setUseOkpd2(checked === true)}
+                  />
+                  <Label
+                    htmlFor="use-okpd2"
+                    className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 cursor-pointer"
+                  >
+                    Классификация по ОКПД2
+                  </Label>
+                </div>
+                <p className="text-xs text-muted-foreground ml-6">
+                  После нормализации выполнить автоматическую классификацию по классификатору ОКПД2
+                </p>
+              </div>
             </div>
           )}
 

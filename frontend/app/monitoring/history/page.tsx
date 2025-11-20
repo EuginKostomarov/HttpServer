@@ -65,7 +65,10 @@ export default function MonitoringHistoryPage() {
 
       const response = await fetch(`/api/monitoring/history?${params}`)
       if (response.ok) {
-        const data = await response.json()
+        const responseData = await response.json()
+        
+        // Backend returns { count, snapshots }, so we need to extract snapshots
+        const data = responseData.snapshots || responseData || []
 
         // Transform data into chart format
         const transformed: HistoryData = {
@@ -77,7 +80,9 @@ export default function MonitoringHistoryPage() {
           circuit_breaker_failures: [],
         }
 
-        data.forEach((item: any) => {
+        // Ensure data is an array
+        const snapshots = Array.isArray(data) ? data : []
+        snapshots.forEach((item: any) => {
           const timestamp = item.timestamp
 
           if (item.ai_success_rate !== null && item.ai_success_rate !== undefined) {

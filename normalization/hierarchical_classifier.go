@@ -613,3 +613,12 @@ func (h *HierarchicalClassifier) SetMinConfidence(confidence float64) {
 		log.Printf("[Config] Min confidence set to %.2f", confidence)
 	}
 }
+
+// WaitForCircuitBreakerRecovery ждет, пока circuit breaker восстановится
+// Возвращает true если circuit breaker готов к работе, false если произошла ошибка или таймаут
+func (h *HierarchicalClassifier) WaitForCircuitBreakerRecovery(maxWaitTime time.Duration) bool {
+	if h.aiClient == nil {
+		return true // Если AI клиент не инициализирован, считаем что все готово
+	}
+	return h.aiClient.WaitForCircuitBreakerRecovery(maxWaitTime)
+}

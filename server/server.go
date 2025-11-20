@@ -13,18 +13,21 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"httpserver/database"
+	"httpserver/enrichment"
 	"httpserver/nomenclature"
 	"httpserver/normalization"
 	"httpserver/quality"
 	"httpserver/server/middleware"
 
 	"github.com/google/uuid"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 // Server HTTP сервер для приема данных из 1С
@@ -67,6 +70,8 @@ type Server struct {
 	// Флаг остановки воркеров КПВЭД классификации
 	kpvedWorkersStopped   bool
 	kpvedWorkersStopMutex sync.RWMutex
+	// Обогащение контрагентов
+	enrichmentFactory *enrichment.EnricherFactory
 }
 
 // QualityAnalysisStatus статус анализа качества
@@ -122,6 +127,15 @@ func NewServerWithConfig(db *database.DB, normalizedDB *database.DB, serviceDB *
 	arliaiClient := NewArliaiClient()
 	arliaiCache := NewArliaiCache()
 
+	// Инициализируем фабрику обогатителей
+	var enrichmentFactory *enrichment.EnricherFactory
+	if config.Enrichment != nil && config.Enrichment.Enabled {
+		enrichmentFactory = enrichment.NewEnricherFactory(config.Enrichment.Services)
+		log.Printf("Enrichment factory initialized with %d services", len(config.Enrichment.Services))
+	} else {
+		log.Printf("Enrichment is disabled")
+	}
+
 	// Инициализируем KPVED hierarchical classifier
 	var hierarchicalClassifier *normalization.HierarchicalClassifier
 
@@ -174,6 +188,7 @@ func NewServerWithConfig(db *database.DB, normalizedDB *database.DB, serviceDB *
 		hierarchicalClassifier:  hierarchicalClassifier,
 		kpvedCurrentTasks:       make(map[int]*classificationTask),
 		kpvedWorkersStopped:     false,
+		enrichmentFactory:       enrichmentFactory,
 	}
 }
 
@@ -199,12 +214,123 @@ func (s *Server) Start() error {
 		IdleTimeout:  120 * time.Second, // Таймаут для idle соединений
 	}
 
+	// Инициализируем дефолтные привязки классификаторов к типам проектов
+	s.initDefaultProjectTypeClassifiers()
+
+	// Запускаем фоновую задачу для проверки зависших сессий
+	go s.startSessionTimeoutChecker()
+
 	// Запускаем сервер
 	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return err
 	}
 
 	return nil
+}
+
+// startSessionTimeoutChecker запускает фоновую задачу для проверки зависших сессий
+func (s *Server) startSessionTimeoutChecker() {
+	ticker := time.NewTicker(1 * time.Minute) // Проверяем каждую минуту
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			count, err := s.serviceDB.CheckAndMarkTimeoutSessions()
+			if err != nil {
+				log.Printf("Error checking timeout sessions: %v", err)
+			} else if count > 0 {
+				log.Printf("Marked %d sessions as timeout", count)
+			}
+		case <-s.shutdownChan:
+			return
+		}
+	}
+}
+
+// initDefaultProjectTypeClassifiers инициализирует дефолтные привязки классификаторов к типам проектов
+func (s *Server) initDefaultProjectTypeClassifiers() {
+	if s.serviceDB == nil {
+		log.Printf("Warning: ServiceDB not initialized, skipping default project type classifiers initialization")
+		return
+	}
+
+	// Получаем все существующие привязки
+	existing, err := s.serviceDB.GetAllProjectTypeClassifiers()
+	if err != nil {
+		log.Printf("Warning: Failed to get existing project type classifiers: %v", err)
+		return
+	}
+
+	// Если уже есть привязки, не инициализируем
+	if len(existing) > 0 {
+		log.Printf("Project type classifiers already initialized, skipping")
+		return
+	}
+
+	// Получаем все классификаторы через serviceDB
+	// Используем прямой SQL запрос, так как GetCategoryClassifiersByFilter находится в database.DB
+	query := `SELECT id, name FROM category_classifiers WHERE is_active = TRUE`
+	rows, err := s.serviceDB.Query(query)
+	if err != nil {
+		log.Printf("Warning: Failed to get classifiers: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	classifierMap := make(map[string]int)
+	for rows.Next() {
+		var id int
+		var name string
+		if err := rows.Scan(&id, &name); err != nil {
+			log.Printf("Warning: Failed to scan classifier: %v", err)
+			continue
+		}
+		classifierMap[name] = id
+	}
+
+	// Привязываем классификаторы к типу nomenclature_counterparties
+	projectType := "nomenclature_counterparties"
+	bindings := []struct {
+		name      string
+		isDefault bool
+	}{
+		{"Adata.kz", true},
+		{"DaData.ru", true},
+		{"КПВЭД", true},
+	}
+
+	created := 0
+	for _, binding := range bindings {
+		if classifierID, exists := classifierMap[binding.name]; exists {
+			_, err := s.serviceDB.CreateProjectTypeClassifier(projectType, classifierID, binding.isDefault)
+			if err != nil {
+				log.Printf("Warning: Failed to create project type classifier binding for %s: %v", binding.name, err)
+			} else {
+				created++
+				log.Printf("Created project type classifier binding: %s -> %s", projectType, binding.name)
+			}
+		} else {
+			log.Printf("Warning: Classifier '%s' not found, skipping binding", binding.name)
+		}
+	}
+
+	if created > 0 {
+		log.Printf("Initialized %d default project type classifier bindings for %s", created, projectType)
+	} else if len(classifierMap) == 0 {
+		log.Printf("Info: No classifiers found in database. Classifiers need to be created first before binding to project types.")
+		log.Printf("Info: To create classifiers, use the classification API or load them from external sources.")
+	} else {
+		missing := []string{}
+		for _, binding := range bindings {
+			if _, exists := classifierMap[binding.name]; !exists {
+				missing = append(missing, binding.name)
+			}
+		}
+		if len(missing) > 0 {
+			log.Printf("Info: Some classifiers not found for binding: %v. They need to be created first.", missing)
+		}
+	}
 }
 
 // setupMux настраивает маршруты и возвращает http.Handler
@@ -292,8 +418,15 @@ func (s *Server) setupMux() http.Handler {
 	mux.HandleFunc("/api/kpved/stats", s.handleKpvedStats)
 	mux.HandleFunc("/api/kpved/load", s.handleKpvedLoad)
 	mux.HandleFunc("/api/kpved/load-from-file", s.handleKpvedLoadFromFile)
+
+	// ОКПД2 endpoints
+	mux.HandleFunc("/api/okpd2/hierarchy", s.handleOkpd2Hierarchy)
+	mux.HandleFunc("/api/okpd2/search", s.handleOkpd2Search)
+	mux.HandleFunc("/api/okpd2/stats", s.handleOkpd2Stats)
+	mux.HandleFunc("/api/okpd2/load-from-file", s.handleOkpd2LoadFromFile)
 	mux.HandleFunc("/api/kpved/classify-test", s.handleKpvedClassifyTest)
 	mux.HandleFunc("/api/kpved/classify-hierarchical", s.handleKpvedClassifyHierarchical)
+	mux.HandleFunc("/api/models/benchmark", s.handleModelsBenchmark)
 	mux.HandleFunc("/api/kpved/reclassify", s.handleKpvedReclassify)
 	mux.HandleFunc("/api/kpved/reclassify-hierarchical", s.handleKpvedReclassifyHierarchical)
 	mux.HandleFunc("/api/kpved/current-tasks", s.handleKpvedCurrentTasks)
@@ -315,6 +448,7 @@ func (s *Server) setupMux() http.Handler {
 
 	// Регистрируем эндпоинты для качества нормализации
 	mux.HandleFunc("/api/quality/stats", s.handleQualityStats)
+	mux.HandleFunc("/api/quality/report", s.handleGetQualityReport)
 	mux.HandleFunc("/api/quality/item/", s.handleQualityItemDetail)
 	mux.HandleFunc("/api/quality/violations", s.handleQualityViolations)
 	mux.HandleFunc("/api/quality/violations/", s.handleQualityViolationDetail)
@@ -333,6 +467,7 @@ func (s *Server) setupMux() http.Handler {
 
 	// Регистрируем эндпоинты для версионирования нормализации
 	mux.HandleFunc("/api/normalization/start", s.handleStartNormalization)
+	mux.HandleFunc("/api/databases/find-project", s.handleFindProjectByDatabase)
 	mux.HandleFunc("/api/normalization/apply-patterns", s.handleApplyPatterns)
 	mux.HandleFunc("/api/normalization/apply-ai", s.handleApplyAI)
 	mux.HandleFunc("/api/normalization/history", s.handleGetSessionHistory)
@@ -348,6 +483,8 @@ func (s *Server) setupMux() http.Handler {
 	mux.HandleFunc("/api/classification/strategies/create", s.handleCreateOrUpdateClientStrategy)
 	mux.HandleFunc("/api/classification/available", s.handleGetAvailableStrategies)
 	mux.HandleFunc("/api/classification/classifiers", s.handleGetClassifiers)
+	mux.HandleFunc("/api/classification/classifiers/by-project-type", s.handleGetClassifiersByProjectType)
+	mux.HandleFunc("/api/classification/optimization-stats", s.handleClassificationOptimizationStats)
 
 	// Регистрируем эндпоинты для переклассификации
 	mux.HandleFunc("/api/reclassification/start", s.handleReclassificationStart)
@@ -378,9 +515,44 @@ func (s *Server) setupMux() http.Handler {
 	mux.HandleFunc("/api/databases/analytics/", s.handleDatabaseAnalytics)
 	mux.HandleFunc("/api/databases/history/", s.handleDatabaseHistory)
 
+	// Регистрируем эндпоинты для дашборда
+	mux.HandleFunc("/api/dashboard/stats", s.handleGetDashboardStats)
+	// mux.HandleFunc("/api/normalization/status", s.handleGetNormalizationStatus) // Уже есть handleNormalizationStatus
+	mux.HandleFunc("/api/quality/metrics", s.handleGetQualityMetrics)
+
+	// Регистрируем эндпоинты для pending databases
+	mux.HandleFunc("/api/databases/pending", s.handlePendingDatabases)
+	mux.HandleFunc("/api/databases/pending/", s.handlePendingDatabaseRoutes)
+	mux.HandleFunc("/api/databases/scan", s.handleScanDatabases)
+
 	// Регистрируем эндпоинты для работы с клиентами
 	mux.HandleFunc("/api/clients", s.handleClients)
 	mux.HandleFunc("/api/clients/", s.handleClientRoutes)
+
+	// Регистрируем эндпоинты для дублей контрагентов
+	mux.HandleFunc("/api/counterparties/duplicates", s.handleCounterpartyDuplicates)
+	mux.HandleFunc("/api/counterparties/duplicates/", s.handleCounterpartyDuplicateRoutes)
+
+	// API для управления эталонами
+	mux.HandleFunc("/api/benchmarks/import-manufacturers", s.handleImportManufacturers)
+
+	// API для работы с номенклатурами из gisp.gov.ru
+	mux.HandleFunc("/api/gisp/nomenclatures/import", s.handleImportGISPNomenclatures)
+	mux.HandleFunc("/api/gisp/nomenclatures", s.handleGetGISPNomenclatures)
+	mux.HandleFunc("/api/gisp/nomenclatures/", s.handleGetGISPNomenclatureDetail)
+
+	// Регистрируем эндпоинты для дашборда
+	mux.HandleFunc("/api/dashboard/stats", s.handleGetDashboardStats)
+	mux.HandleFunc("/api/dashboard/normalization-status", s.handleGetDashboardNormalizationStatus)
+	mux.HandleFunc("/api/quality/metrics", s.handleGetQualityMetrics)
+
+	mux.HandleFunc("/api/gisp/reference-books", s.handleGetGISPReferenceBooks)
+	mux.HandleFunc("/api/gisp/reference-books/search", s.handleSearchGISPReferenceBook)
+	mux.HandleFunc("/api/gisp/statistics", s.handleGetGISPStatistics)
+
+	// Регистрируем эндпоинты для нормализованных контрагентов
+	mux.HandleFunc("/api/counterparties/normalized", s.handleNormalizedCounterparties)
+	mux.HandleFunc("/api/counterparties/normalized/", s.handleNormalizedCounterpartyRoutes)
 
 	// Регистрируем эндпоинт для генерации XML обработки 1С
 	mux.HandleFunc("/api/1c/processing/xml", s.handle1CProcessingXML)
@@ -1213,19 +1385,16 @@ func (s *Server) handleDatabaseV1Routes(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Получаем информацию о проекте
-	project, err := s.serviceDB.GetClientProject(dbInfo.ClientProjectID)
+	// Получаем информацию о базе данных с проектом и клиентом одним запросом
+	dbWithProject, err := s.serviceDB.GetProjectDatabaseWithClient(databaseID)
 	if err != nil {
-		s.writeErrorResponse(w, "Failed to get project", err)
+		s.writeErrorResponse(w, "Failed to get database info", err)
 		return
 	}
 
-	// Получаем информацию о клиенте
-	client, err := s.serviceDB.GetClient(project.ClientID)
-	if err != nil {
-		s.writeErrorResponse(w, "Failed to get client", err)
-		return
-	}
+	project := dbWithProject.Project
+	client := project.Client
+	dbInfo = &dbWithProject.ProjectDatabase
 
 	// Формируем XML ответ
 	response := DatabaseInfoResponse{
@@ -1369,22 +1538,63 @@ func (s *Server) CollectMetricsSnapshot() *database.PerformanceMetricsSnapshot {
 		checkpointProgress = progress
 	}
 
-	// Создаем snapshot с минимальными данными
+	// Формируем детальные метрики в JSON
+	detailedMetrics := map[string]interface{}{
+		"uptime_seconds":        int(uptime),
+		"throughput":            throughput,
+		"ai_success_rate":       aiSuccessRate,
+		"cache_hit_rate":       cacheHitRate,
+		"circuit_breaker_state": cbState["state"].(string),
+		"checkpoint_progress":   checkpointProgress,
+	}
+
+	// Добавляем batch queue size если доступен
+	var batchQueueSize int
+	if queueSize, ok := batchStats["queue_size"].(int); ok {
+		batchQueueSize = queueSize
+		detailedMetrics["batch_queue_size"] = queueSize
+	}
+
+	// Добавляем детальные метрики из statsCollector если доступны
+	if s.normalizer != nil && s.normalizer.GetAINormalizer() != nil {
+		statsCollector := s.normalizer.GetAINormalizer().GetStatsCollector()
+		if statsCollector != nil {
+			perfMetrics := statsCollector.GetMetrics()
+			detailedMetrics["ai_requests"] = map[string]interface{}{
+				"total":     perfMetrics.TotalAIRequests,
+				"successful": perfMetrics.SuccessfulAIRequest,
+				"failed":    perfMetrics.TotalAIRequests - perfMetrics.SuccessfulAIRequest,
+			}
+			detailedMetrics["normalized_count"] = perfMetrics.TotalNormalized
+		}
+
+		cacheStats := s.normalizer.GetAINormalizer().GetCacheStats()
+		detailedMetrics["cache"] = map[string]interface{}{
+			"hits":     cacheStats.Hits,
+			"misses":   cacheStats.Misses,
+			"hit_rate": cacheStats.HitRate,
+		}
+	}
+
+	// Сериализуем детальные метрики в JSON
+	metricDataJSON, err := json.Marshal(detailedMetrics)
+	if err != nil {
+		log.Printf("Failed to marshal detailed metrics: %v", err)
+		metricDataJSON = []byte("{}")
+	}
+
+	// Создаем snapshot с детальными метриками
 	snapshot := &database.PerformanceMetricsSnapshot{
 		Timestamp:           time.Now(),
 		MetricType:          "all", // Общие метрики
-		MetricData:          "",    // TODO: JSON с детальными метриками
+		MetricData:          string(metricDataJSON),
 		UptimeSeconds:       int(uptime),
 		Throughput:          throughput,
 		AISuccessRate:       aiSuccessRate,
 		CacheHitRate:        cacheHitRate,
 		CircuitBreakerState: cbState["state"].(string),
 		CheckpointProgress:  checkpointProgress,
-	}
-
-	// Добавляем batch queue size если доступен
-	if queueSize, ok := batchStats["queue_size"].(int); ok {
-		snapshot.BatchQueueSize = queueSize
+		BatchQueueSize:      batchQueueSize,
 	}
 
 	return snapshot
@@ -2851,9 +3061,8 @@ func (s *Server) startNomenclatureProcessing(w http.ResponseWriter, r *http.Requ
 		defer func() {
 			processor.Close()
 			// Очищаем процессор после завершения (опционально, можно оставить для просмотра итогов)
-			s.processorMutex.Lock()
 			// Не очищаем сразу, оставляем для просмотра итогов до следующего запуска
-			s.processorMutex.Unlock()
+			// Критическая секция удалена, так как не используется
 		}()
 		if err := processor.ProcessAll(); err != nil {
 			log.Printf("Ошибка обработки номенклатуры: %v", err)
@@ -2925,6 +3134,7 @@ func (s *Server) handleNormalizeStart(w http.ResponseWriter, r *http.Request) {
 		Model            string  `json:"model"`     // Выбранная модель AI
 		Database         string  `json:"database"`  // База данных для нормализации
 		UseKpved         bool    `json:"use_kpved"` // Включить КПВЭД классификацию
+		UseOkpd2         bool    `json:"use_okpd2"` // Включить ОКПД2 классификацию
 	}
 
 	var req NormalizeRequest
@@ -3044,9 +3254,22 @@ func (s *Server) handleNormalizeStart(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Создан временный normalizer для БД: %s", req.Database)
 	} else {
 		// Используем стандартный normalizer
+		if s.normalizer == nil {
+			s.normalizerMutex.Lock()
+			s.normalizerRunning = false
+			s.normalizerMutex.Unlock()
+			s.writeJSONError(w, "Normalizer not initialized", http.StatusInternalServerError)
+			return
+		}
 		normalizerToUse = s.normalizer
 		log.Printf("Используется стандартный normalizer")
 	}
+
+	// Возвращаем успешный ответ перед запуском горутины
+	s.writeJSONResponse(w, map[string]interface{}{
+		"status":  "started",
+		"message": "Normalization started",
+	}, http.StatusOK)
 
 	// Запускаем нормализацию в горутине
 	go func() {
@@ -3172,9 +3395,12 @@ func (s *Server) handleNormalizeStart(w http.ResponseWriter, r *http.Request) {
 								// Обновляем запись с результатами классификации
 								_, err = dbToUse.Exec(`
 									UPDATE normalized_data
-									SET kpved_code = ?, kpved_name = ?, kpved_confidence = ?
+									SET kpved_code = ?, kpved_name = ?, kpved_confidence = ?,
+									    stage11_kpved_code = ?, stage11_kpved_name = ?, stage11_kpved_confidence = ?,
+									    stage11_kpved_completed = 1, stage11_kpved_completed_at = CURRENT_TIMESTAMP
 									WHERE id = ?
-								`, result.FinalCode, result.FinalName, result.FinalConfidence, record.ID)
+								`, result.FinalCode, result.FinalName, result.FinalConfidence,
+									result.FinalCode, result.FinalName, result.FinalConfidence, record.ID)
 
 								if err != nil {
 									log.Printf("Ошибка обновления КПВЭД для записи %d: %v", record.ID, err)
@@ -3203,6 +3429,165 @@ func (s *Server) handleNormalizeStart(w http.ResponseWriter, r *http.Request) {
 			} else if req.UseKpved {
 				log.Println("КПВЭД классификация запрошена, но классификатор не инициализирован")
 				s.normalizerEvents <- "КПВЭД классификатор не инициализирован. Проверьте ARLIAI_API_KEY"
+			}
+
+			// ОКПД2 классификация после нормализации (и после КПВЭД, если она была)
+			if req.UseOkpd2 {
+				log.Println("Начинаем ОКПД2 классификацию...")
+				s.normalizerEvents <- "Начало ОКПД2 классификации"
+
+				// Определяем какую БД использовать: временную или стандартную
+				dbToUse := s.normalizedDB
+				if tempDB != nil {
+					dbToUse = tempDB
+				}
+
+				// Получаем записи без ОКПД2 классификации
+				rows, err := dbToUse.Query(`
+					SELECT id, normalized_name, category
+					FROM normalized_data
+					WHERE (stage12_okpd2_code IS NULL OR stage12_okpd2_code = '' OR TRIM(stage12_okpd2_code) = '')
+				`)
+				if err != nil {
+					log.Printf("Ошибка получения записей для ОКПД2 классификации: %v", err)
+					s.normalizerEvents <- fmt.Sprintf("Ошибка ОКПД2: %v", err)
+				} else {
+					defer rows.Close()
+
+					var recordsToClassify []struct {
+						ID             int
+						NormalizedName string
+						Category       string
+					}
+
+					for rows.Next() {
+						var record struct {
+							ID             int
+							NormalizedName string
+							Category       string
+						}
+						if err := rows.Scan(&record.ID, &record.NormalizedName, &record.Category); err != nil {
+							log.Printf("Ошибка сканирования записи: %v", err)
+							continue
+						}
+						recordsToClassify = append(recordsToClassify, record)
+					}
+
+					totalToClassify := len(recordsToClassify)
+					if totalToClassify == 0 {
+						log.Println("Нет записей для ОКПД2 классификации")
+						s.normalizerEvents <- "Все записи уже классифицированы по ОКПД2"
+					} else {
+						log.Printf("Найдено записей для ОКПД2 классификации: %d", totalToClassify)
+						s.normalizerEvents <- fmt.Sprintf("Классификация %d записей по ОКПД2", totalToClassify)
+
+						classified := 0
+						failed := 0
+						serviceDB := s.serviceDB.GetDB()
+
+						for i, record := range recordsToClassify {
+							// Простой поиск по ключевым словам в ОКПД2
+							// Извлекаем ключевые слова из нормализованного имени
+							searchTerms := extractKeywords(record.NormalizedName)
+							if len(searchTerms) == 0 {
+								searchTerms = []string{record.NormalizedName}
+							}
+
+							var bestMatch struct {
+								Code       string
+								Name       string
+								Confidence float64
+							}
+							bestMatch.Confidence = 0.0
+
+							// Ищем совпадения по каждому ключевому слову
+							for _, term := range searchTerms {
+								if len(term) < 3 {
+									continue // Пропускаем слишком короткие слова
+								}
+
+								searchPattern := "%" + term + "%"
+								query := `
+									SELECT code, name, level
+									FROM okpd2_classifier
+									WHERE name LIKE ?
+									ORDER BY 
+										CASE 
+											WHEN name LIKE ? THEN 1
+											WHEN name LIKE ? THEN 2
+											ELSE 3
+										END,
+										level DESC
+									LIMIT 5
+								`
+								exactPattern := term
+								startPattern := term + "%"
+
+								rows, err := serviceDB.Query(query, searchPattern, exactPattern, startPattern)
+								if err != nil {
+									log.Printf("Ошибка поиска ОКПД2 для '%s': %v", term, err)
+									continue
+								}
+
+								for rows.Next() {
+									var code, name string
+									var level int
+									if err := rows.Scan(&code, &name, &level); err != nil {
+										continue
+									}
+
+									// Вычисляем уверенность на основе совпадения
+									confidence := calculateOkpd2Confidence(term, name, level)
+									if confidence > bestMatch.Confidence {
+										bestMatch.Code = code
+										bestMatch.Name = name
+										bestMatch.Confidence = confidence
+									}
+								}
+								rows.Close()
+							}
+
+							// Если нашли совпадение с достаточной уверенностью, сохраняем
+							if bestMatch.Confidence >= 0.3 && bestMatch.Code != "" {
+								_, err = dbToUse.Exec(`
+									UPDATE normalized_data
+									SET stage12_okpd2_code = ?, stage12_okpd2_name = ?, stage12_okpd2_confidence = ?,
+									    stage12_okpd2_completed = 1, stage12_okpd2_completed_at = CURRENT_TIMESTAMP
+									WHERE id = ?
+								`, bestMatch.Code, bestMatch.Name, bestMatch.Confidence, record.ID)
+
+								if err != nil {
+									log.Printf("Ошибка обновления ОКПД2 для записи %d: %v", record.ID, err)
+									failed++
+									continue
+								}
+
+								classified++
+							} else {
+								// Отмечаем как обработанное, но без результата
+								_, err = dbToUse.Exec(`
+									UPDATE normalized_data
+									SET stage12_okpd2_completed = 1, stage12_okpd2_completed_at = CURRENT_TIMESTAMP
+									WHERE id = ?
+								`, record.ID)
+								if err != nil {
+									log.Printf("Ошибка обновления статуса ОКПД2 для записи %d: %v", record.ID, err)
+								}
+								failed++
+							}
+
+							// Логируем прогресс каждые 10 записей или на последней записи
+							if (i+1)%10 == 0 || i+1 == totalToClassify {
+								progress := float64(i+1) / float64(totalToClassify) * 100
+								log.Printf("ОКПД2 классификация: %d/%d (%.1f%%)", i+1, totalToClassify, progress)
+								s.normalizerEvents <- fmt.Sprintf("ОКПД2: %d/%d (%.1f%%)", i+1, totalToClassify, progress)
+							}
+						}
+
+						log.Printf("ОКПД2 классификация завершена: классифицировано %d из %d записей (не найдено: %d)", classified, totalToClassify, failed)
+						s.normalizerEvents <- fmt.Sprintf("ОКПД2 классификация завершена: %d/%d (не найдено: %d)", classified, totalToClassify, failed)
+					}
+				}
 			}
 		}
 	}()
@@ -4164,25 +4549,18 @@ func (s *Server) handleDatabasesList(w http.ResponseWriter, r *http.Request) {
 	var allFiles []string
 
 	// 1. Текущая директория
-	files, err := filepath.Glob("*.db")
-	if err == nil {
+	if files, err := filepath.Glob("*.db"); err == nil {
 		allFiles = append(allFiles, files...)
 	}
 
 	// 2. Директория /app/data (для Docker)
-	dataFiles, err := filepath.Glob("data/*.db")
-	if err == nil {
-		for _, file := range dataFiles {
-			allFiles = append(allFiles, file)
-		}
+	if dataFiles, err := filepath.Glob("data/*.db"); err == nil {
+		allFiles = append(allFiles, dataFiles...)
 	}
 
 	// 3. Директория /app/data (абсолютный путь для Docker)
-	absDataFiles, err := filepath.Glob("/app/data/*.db")
-	if err == nil {
-		for _, file := range absDataFiles {
-			allFiles = append(allFiles, file)
-		}
+	if absDataFiles, err := filepath.Glob("/app/data/*.db"); err == nil {
+		allFiles = append(allFiles, absDataFiles...)
 	}
 
 	// 4. Директория /app (абсолютный путь для Docker)
@@ -4621,10 +4999,8 @@ func (s *Server) getNomenclatureStatus(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-// getProcessingStatus возвращает статус обработки номенклатуры (старый метод для совместимости)
-func (s *Server) getProcessingStatus(w http.ResponseWriter, r *http.Request) {
-	s.getNomenclatureStatus(w, r)
-}
+// getProcessingStatus удален - используйте getNomenclatureStatus напрямую
+// Оставлен комментарий для совместимости
 
 // getNomenclatureRecentRecords возвращает последние обработанные записи
 func (s *Server) getNomenclatureRecentRecords(w http.ResponseWriter, r *http.Request) {
@@ -5363,9 +5739,9 @@ func (s *Server) handleClientRoutes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	clientID, err := strconv.Atoi(parts[0])
+	clientID, err := ValidateIntPathParam(parts[0], "client_id")
 	if err != nil {
-		http.Error(w, "Invalid client ID", http.StatusBadRequest)
+		s.HandleValidationError(w, err)
 		return
 	}
 
@@ -5386,9 +5762,9 @@ func (s *Server) handleClientRoutes(w http.ResponseWriter, r *http.Request) {
 			}
 			// Обработка /api/clients/{id}/projects/{projectId}...
 			if len(parts) >= 3 {
-				projectID, err := strconv.Atoi(parts[2])
+				projectID, err := ValidateIntPathParam(parts[2], "project_id")
 				if err != nil {
-					http.Error(w, "Invalid project ID", http.StatusBadRequest)
+					s.HandleValidationError(w, err)
 					return
 				}
 
@@ -5426,7 +5802,15 @@ func (s *Server) handleClientRoutes(w http.ResponseWriter, r *http.Request) {
 						if r.Method == http.MethodGet {
 							s.handleGetProjectDatabases(w, r, clientID, projectID)
 						} else if r.Method == http.MethodPost {
-							s.handleCreateProjectDatabase(w, r, clientID, projectID)
+							// Проверяем Content-Type для определения типа запроса
+							contentType := r.Header.Get("Content-Type")
+							if strings.HasPrefix(contentType, "multipart/form-data") {
+								// Загрузка файла
+								s.handleUploadProjectDatabase(w, r, clientID, projectID)
+							} else {
+								// Обычный JSON запрос
+								s.handleCreateProjectDatabase(w, r, clientID, projectID)
+							}
 						} else {
 							http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 						}
@@ -5435,9 +5819,9 @@ func (s *Server) handleClientRoutes(w http.ResponseWriter, r *http.Request) {
 
 					if len(parts) == 5 {
 						// GET/PUT/DELETE /api/clients/{id}/projects/{projectId}/databases/{dbId}
-						dbID, err := strconv.Atoi(parts[4])
+						dbID, err := ValidateIntPathParam(parts[4], "database_id")
 						if err != nil {
-							http.Error(w, "Invalid database ID", http.StatusBadRequest)
+							s.HandleValidationError(w, err)
 							return
 						}
 
@@ -5452,6 +5836,36 @@ func (s *Server) handleClientRoutes(w http.ResponseWriter, r *http.Request) {
 							http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 						}
 						return
+					}
+
+					// Обработка /api/clients/{id}/projects/{projectId}/databases/{dbId}/tables
+					if len(parts) >= 6 && parts[5] == "tables" {
+						dbID, err := ValidateIntPathParam(parts[4], "database_id")
+						if err != nil {
+							s.HandleValidationError(w, err)
+							return
+						}
+
+						if len(parts) == 6 {
+							// GET /api/clients/{id}/projects/{projectId}/databases/{dbId}/tables
+							if r.Method == http.MethodGet {
+								s.handleGetProjectDatabaseTables(w, r, clientID, projectID, dbID)
+							} else {
+								http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+							}
+							return
+						}
+
+						if len(parts) == 7 {
+							// GET /api/clients/{id}/projects/{projectId}/databases/{dbId}/tables/{tableName}
+							tableName := parts[6]
+							if r.Method == http.MethodGet {
+								s.handleGetProjectDatabaseTableData(w, r, clientID, projectID, dbID, tableName)
+							} else {
+								http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+							}
+							return
+						}
 					}
 				}
 
@@ -5487,9 +5901,46 @@ func (s *Server) handleClientRoutes(w http.ResponseWriter, r *http.Request) {
 								http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 							}
 							return
+						case "groups":
+							if r.Method == http.MethodGet {
+								s.handleGetClientNormalizationGroups(w, r, clientID, projectID)
+							} else {
+								http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+							}
+							return
+						case "sessions":
+							if r.Method == http.MethodGet {
+								s.handleGetNormalizationSessions(w, r, clientID, projectID)
+							} else if r.Method == http.MethodPost {
+								s.handleUpdateSessionPriority(w, r, clientID, projectID)
+							} else {
+								http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+							}
+							return
 						}
 					}
+					// Обработка /api/clients/{id}/projects/{projectId}/normalization/sessions/{sessionId}
+					if len(parts) == 6 && parts[4] == "sessions" {
+						sessionIDStr := parts[5]
+						sessionID, err := strconv.Atoi(sessionIDStr)
+						if err == nil && r.Method == http.MethodPost {
+							s.handleStopNormalizationSession(w, r, clientID, projectID, sessionID)
+						} else {
+							http.Error(w, "Invalid session ID or method", http.StatusBadRequest)
+						}
+						return
+					}
 					http.Error(w, "Invalid route", http.StatusNotFound)
+					return
+				}
+
+				if len(parts) == 4 && parts[3] == "pipeline-stats" {
+					// Обработка /api/clients/{id}/projects/{projectId}/pipeline-stats
+					if r.Method == http.MethodGet {
+						s.handleGetProjectPipelineStats(w, r, clientID, projectID)
+					} else {
+						http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+					}
 					return
 				}
 			}
@@ -5880,11 +6331,17 @@ func (s *Server) handleGetClientBenchmarks(w http.ResponseWriter, r *http.Reques
 	category := r.URL.Query().Get("category")
 	approvedOnly := r.URL.Query().Get("approved_only") == "true"
 
+	log.Printf("[Benchmarks] Getting benchmarks for project %d, client %d, category: %s, approvedOnly: %v",
+		projectID, clientID, category, approvedOnly)
+
 	benchmarks, err := s.serviceDB.GetClientBenchmarks(projectID, category, approvedOnly)
 	if err != nil {
+		log.Printf("[Benchmarks] Error getting benchmarks: %v", err)
 		s.writeJSONError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	log.Printf("[Benchmarks] Found %d benchmarks for project %d", len(benchmarks), projectID)
 
 	responseBenchmarks := make([]ClientBenchmark, len(benchmarks))
 	for i, b := range benchmarks {
@@ -5906,6 +6363,8 @@ func (s *Server) handleGetClientBenchmarks(w http.ResponseWriter, r *http.Reques
 			UpdatedAt:       b.UpdatedAt,
 		}
 	}
+
+	log.Printf("[Benchmarks] Returning %d benchmarks to client", len(responseBenchmarks))
 
 	s.writeJSONResponse(w, map[string]interface{}{
 		"benchmarks": responseBenchmarks,
@@ -6031,13 +6490,36 @@ func (s *Server) handleCreateProjectDatabase(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	// Получаем размер файла если файл существует
-	var fileSize int64 = 0
-	if fileInfo, err := os.Stat(req.FilePath); err == nil {
-		fileSize = fileInfo.Size()
+	// Проверяем существование файла
+	fileInfo, err := os.Stat(req.FilePath)
+	if err != nil {
+		s.writeJSONError(w, fmt.Sprintf("File not found: %s", req.FilePath), http.StatusBadRequest)
+		return
 	}
 
-	database, err := s.serviceDB.CreateProjectDatabase(projectID, req.Name, req.FilePath, req.Description, fileSize)
+	fileSize := fileInfo.Size()
+	finalPath := req.FilePath
+
+	// Если файл не в data/uploads/, перемещаем его туда
+	uploadsDir, err := EnsureUploadsDirectory(".")
+	if err == nil {
+		// Проверяем, находится ли файл уже в uploads
+		absFilePath, _ := filepath.Abs(req.FilePath)
+		absUploadsDir, _ := filepath.Abs(uploadsDir)
+
+		if !strings.HasPrefix(absFilePath, absUploadsDir) {
+			// Перемещаем файл
+			newPath, moveErr := MoveDatabaseToUploads(req.FilePath, uploadsDir)
+			if moveErr != nil {
+				s.writeJSONError(w, fmt.Sprintf("Failed to move file to uploads: %v", moveErr), http.StatusInternalServerError)
+				return
+			}
+			finalPath = newPath
+			log.Printf("File moved to uploads: %s -> %s", req.FilePath, finalPath)
+		}
+	}
+
+	database, err := s.serviceDB.CreateProjectDatabase(projectID, req.Name, finalPath, req.Description, fileSize)
 	if err != nil {
 		s.writeJSONError(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -6174,27 +6656,157 @@ func (s *Server) handleDeleteProjectDatabase(w http.ResponseWriter, r *http.Requ
 	}, http.StatusOK)
 }
 
-// handleStartClientNormalization запускает нормализацию для клиента
-func (s *Server) handleStartClientNormalization(w http.ResponseWriter, r *http.Request, clientID, projectID int) {
-	s.normalizerMutex.Lock()
-	defer s.normalizerMutex.Unlock()
+// isValidTableName проверяет, что имя таблицы безопасно (защита от SQL-инъекций)
+func isValidTableName(name string) bool {
+	if len(name) == 0 || len(name) > 100 {
+		return false
+	}
+	// Разрешаем только буквы, цифры и подчеркивания
+	for _, r := range name {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_') {
+			return false
+		}
+	}
+	return true
+}
 
-	if s.normalizerRunning {
-		s.writeJSONError(w, "Normalization is already running", http.StatusBadRequest)
+// handleGetProjectDatabaseTables получает список таблиц базы данных проекта
+func (s *Server) handleGetProjectDatabaseTables(w http.ResponseWriter, r *http.Request, clientID, projectID, dbID int) {
+	// Проверяем существование проекта
+	project, err := s.serviceDB.GetClientProject(projectID)
+	if err != nil {
+		s.writeJSONError(w, "Project not found", http.StatusNotFound)
 		return
 	}
 
-	// Читаем путь к базе данных из запроса
-	var req struct {
-		DatabasePath string `json:"database_path"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.writeJSONError(w, "Invalid request body", http.StatusBadRequest)
+	if project.ClientID != clientID {
+		s.writeJSONError(w, "Project does not belong to this client", http.StatusBadRequest)
 		return
 	}
 
-	if req.DatabasePath == "" {
-		s.writeJSONError(w, "Database path is required", http.StatusBadRequest)
+	// Получаем информацию о базе данных
+	database, err := s.serviceDB.GetProjectDatabase(dbID)
+	if err != nil {
+		s.writeJSONError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if database == nil {
+		s.writeJSONError(w, "Database not found", http.StatusNotFound)
+		return
+	}
+
+	if database.ClientProjectID != projectID {
+		s.writeJSONError(w, "Database does not belong to this project", http.StatusBadRequest)
+		return
+	}
+
+	// Проверяем существование файла
+	if _, err := os.Stat(database.FilePath); os.IsNotExist(err) {
+		s.writeJSONError(w, fmt.Sprintf("Database file not found: %s", database.FilePath), http.StatusNotFound)
+		return
+	}
+
+	// Открываем базу данных проекта
+	conn, err := sql.Open("sqlite3", database.FilePath)
+	if err != nil {
+		log.Printf("Error opening database %s: %v", database.FilePath, err)
+		s.writeJSONError(w, fmt.Sprintf("Failed to open database: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer conn.Close()
+
+	// Получаем список таблиц
+	rows, err := conn.Query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+	if err != nil {
+		log.Printf("Error querying tables: %v", err)
+		s.writeJSONError(w, fmt.Sprintf("Failed to query tables: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type ColumnInfo struct {
+		Name     string `json:"name"`
+		Type     string `json:"type"`
+		Nullable bool   `json:"nullable"`
+		Default  string `json:"default"`
+	}
+
+	type TableInfo struct {
+		Name         string       `json:"name"`
+		RecordsCount int          `json:"records_count"`
+		Columns      []ColumnInfo `json:"columns"`
+	}
+
+	tables := []TableInfo{}
+	totalRecords := 0
+
+	for rows.Next() {
+		var tableName string
+		if err := rows.Scan(&tableName); err != nil {
+			continue
+		}
+
+		tableInfo := TableInfo{Name: tableName}
+
+		// Получаем количество записей
+		var count int
+		err := conn.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", tableName)).Scan(&count)
+		if err != nil {
+			log.Printf("Error counting records in table %s: %v", tableName, err)
+			count = 0
+		}
+		tableInfo.RecordsCount = count
+		totalRecords += count
+
+		// Получаем информацию о колонках
+		colRows, err := conn.Query(fmt.Sprintf("PRAGMA table_info(%s)", tableName))
+		if err == nil {
+			columns := []ColumnInfo{}
+			for colRows.Next() {
+				var col ColumnInfo
+				var cid int
+				var notNull int
+				var pk int
+				var dfltValue sql.NullString
+
+				if err := colRows.Scan(&cid, &col.Name, &col.Type, &notNull, &dfltValue, &pk); err == nil {
+					col.Nullable = (notNull == 0)
+					if dfltValue.Valid {
+						col.Default = dfltValue.String
+					}
+					columns = append(columns, col)
+				}
+			}
+			colRows.Close()
+			tableInfo.Columns = columns
+		}
+
+		tables = append(tables, tableInfo)
+	}
+
+	// Формируем ответ с информацией о базе данных и таблицах
+	response := map[string]interface{}{
+		"database": map[string]interface{}{
+			"id":            database.ID,
+			"name":          database.Name,
+			"path":          database.FilePath,
+			"size":          database.FileSize,
+			"tables_count":  len(tables),
+			"total_records": totalRecords,
+			"created_at":    database.CreatedAt.Format(time.RFC3339),
+		},
+		"tables": tables,
+	}
+
+	s.writeJSONResponse(w, response, http.StatusOK)
+}
+
+// handleGetProjectDatabaseTableData получает данные из таблицы базы данных проекта с пагинацией
+func (s *Server) handleGetProjectDatabaseTableData(w http.ResponseWriter, r *http.Request, clientID, projectID, dbID int, tableName string) {
+	// Валидация имени таблицы
+	if !isValidTableName(tableName) {
+		s.writeJSONError(w, "Invalid table name", http.StatusBadRequest)
 		return
 	}
 
@@ -6210,54 +6822,832 @@ func (s *Server) handleStartClientNormalization(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Открываем подключение к указанной базе данных
-	sourceDB, err := database.NewDB(req.DatabasePath)
+	// Получаем информацию о базе данных
+	database, err := s.serviceDB.GetProjectDatabase(dbID)
 	if err != nil {
-		s.writeJSONError(w, fmt.Sprintf("Failed to open database: %v", err), http.StatusBadRequest)
+		s.writeJSONError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// Получаем все записи из catalog_items указанной БД
-	items, err := sourceDB.GetAllCatalogItems()
-	if err != nil {
-		sourceDB.Close()
-		s.writeJSONError(w, fmt.Sprintf("Failed to read data: %v", err), http.StatusInternalServerError)
+	if database == nil {
+		s.writeJSONError(w, "Database not found", http.StatusNotFound)
 		return
 	}
 
-	log.Printf("Starting normalization for project %d with %d items from %s", projectID, len(items), req.DatabasePath)
+	if database.ClientProjectID != projectID {
+		s.writeJSONError(w, "Database does not belong to this project", http.StatusBadRequest)
+		return
+	}
 
-	// Создаем клиентский нормализатор (используем sourceDB для чтения данных)
-	// Передаем workerConfigManager для получения правильной модели
-	clientNormalizer := normalization.NewClientNormalizerWithConfig(clientID, projectID, sourceDB, s.serviceDB, s.normalizerEvents, s.workerConfigManager)
+	// Проверяем существование файла
+	if _, err := os.Stat(database.FilePath); os.IsNotExist(err) {
+		s.writeJSONError(w, fmt.Sprintf("Database file not found: %s", database.FilePath), http.StatusNotFound)
+		return
+	}
 
-	// Запускаем нормализацию в отдельной горутине
+	// Параметры пагинации
+	page := 1
+	pageSize := 50
+
+	if pageStr := r.URL.Query().Get("page"); pageStr != "" {
+		if p, err := strconv.Atoi(pageStr); err == nil && p > 0 {
+			page = p
+		}
+	}
+
+	if pageSizeStr := r.URL.Query().Get("pageSize"); pageSizeStr != "" {
+		if ps, err := strconv.Atoi(pageSizeStr); err == nil && ps > 0 && ps <= 100 {
+			pageSize = ps
+		}
+	}
+
+	offset := (page - 1) * pageSize
+
+	// Открываем базу данных проекта
+	conn, err := sql.Open("sqlite3", database.FilePath)
+	if err != nil {
+		log.Printf("Error opening database %s: %v", database.FilePath, err)
+		s.writeJSONError(w, fmt.Sprintf("Failed to open database: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer conn.Close()
+
+	// Проверяем существование таблицы
+	var tableExists bool
+	err = conn.QueryRow(`
+		SELECT COUNT(*) > 0 
+		FROM sqlite_master 
+		WHERE type='table' AND name=?
+	`, tableName).Scan(&tableExists)
+	if err != nil || !tableExists {
+		s.writeJSONError(w, "Table not found", http.StatusNotFound)
+		return
+	}
+
+	// Получаем общее количество записей
+	var total int
+	err = conn.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", tableName)).Scan(&total)
+	if err != nil {
+		log.Printf("Error counting records in table %s: %v", tableName, err)
+		total = 0
+	}
+
+	// Получаем информацию о колонках
+	colRows, err := conn.Query(fmt.Sprintf("PRAGMA table_info(%s)", tableName))
+	if err != nil {
+		s.writeJSONError(w, fmt.Sprintf("Failed to get table structure: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer colRows.Close()
+
+	columns := []string{}
+	for colRows.Next() {
+		var cid int
+		var name, colType string
+		var notNull, pk int
+		var dfltValue sql.NullString
+
+		if err := colRows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err == nil {
+			columns = append(columns, name)
+		}
+	}
+
+	if len(columns) == 0 {
+		s.writeJSONError(w, "Table has no columns", http.StatusBadRequest)
+		return
+	}
+
+	// Получаем данные с пагинацией
+	query := fmt.Sprintf("SELECT * FROM %s LIMIT ? OFFSET ?", tableName)
+	rows, err := conn.Query(query, pageSize, offset)
+	if err != nil {
+		log.Printf("Error querying table data: %v", err)
+		s.writeJSONError(w, fmt.Sprintf("Failed to query table data: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	// Читаем данные
+	var data []map[string]interface{}
+	for rows.Next() {
+		// Создаем срез для значений
+		values := make([]interface{}, len(columns))
+		valuePtrs := make([]interface{}, len(columns))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		if err := rows.Scan(valuePtrs...); err != nil {
+			log.Printf("Error scanning row: %v", err)
+			continue
+		}
+
+		// Преобразуем в map
+		rowData := make(map[string]interface{})
+		for i, colName := range columns {
+			val := values[i]
+			// Преобразуем []byte в string для читаемости
+			if b, ok := val.([]byte); ok {
+				rowData[colName] = string(b)
+			} else if val == nil {
+				rowData[colName] = nil
+			} else {
+				rowData[colName] = val
+			}
+		}
+		data = append(data, rowData)
+	}
+
+	totalPages := (total + pageSize - 1) / pageSize
+	if totalPages == 0 {
+		totalPages = 1
+	}
+
+	response := map[string]interface{}{
+		"table_name":  tableName,
+		"columns":     columns,
+		"data":        data,
+		"total":       total,
+		"page":        page,
+		"page_size":   pageSize,
+		"total_pages": totalPages,
+	}
+
+	s.writeJSONResponse(w, response, http.StatusOK)
+}
+
+// handleUploadProjectDatabase обрабатывает загрузку файла базы данных через multipart/form-data
+// Enterprise-level security: валидация, санитизация, проверка прав доступа, защита от path traversal
+func (s *Server) handleUploadProjectDatabase(w http.ResponseWriter, r *http.Request, clientID, projectID int) {
+	requestID := r.Header.Get("X-Request-ID")
+	if requestID == "" {
+		requestID = fmt.Sprintf("req_%d_%d", time.Now().Unix(), projectID)
+	}
+	clientIP := r.RemoteAddr
+	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+		clientIP = strings.Split(forwarded, ",")[0]
+	}
+	
+	log.Printf("[handleUploadProjectDatabase] [%s] Начало обработки загрузки файла для проекта %d клиента %d (IP: %s)", requestID, projectID, clientID, clientIP)
+
+	// Проверяем Content-Type (может быть с boundary параметром)
+	contentType := r.Header.Get("Content-Type")
+	log.Printf("[handleUploadProjectDatabase] [%s] Content-Type: %s", requestID, contentType)
+
+	// Проверяем, что это multipart/form-data (может быть с boundary)
+	if !strings.HasPrefix(contentType, "multipart/form-data") {
+		log.Printf("[handleUploadProjectDatabase] Ошибка: неверный Content-Type, ожидается multipart/form-data, получен: %s", contentType)
+		s.writeJSONError(w, fmt.Sprintf("Неверный Content-Type: ожидается multipart/form-data, получен: %s", contentType), http.StatusBadRequest)
+		return
+	}
+
+	// Проверяем существование проекта
+	project, err := s.serviceDB.GetClientProject(projectID)
+	if err != nil {
+		log.Printf("[handleUploadProjectDatabase] Ошибка получения проекта %d: %v", projectID, err)
+		s.writeJSONError(w, "Project not found", http.StatusNotFound)
+		return
+	}
+
+	if project.ClientID != clientID {
+		log.Printf("[handleUploadProjectDatabase] Ошибка: проект %d не принадлежит клиенту %d (принадлежит клиенту %d)", projectID, clientID, project.ClientID)
+		s.writeJSONError(w, "Project does not belong to this client", http.StatusBadRequest)
+		return
+	}
+
+	// Парсим multipart форму (максимальный размер 500MB для баз данных)
+	log.Printf("[handleUploadProjectDatabase] Начало парсинга multipart формы (макс. размер: 500MB)")
+	err = r.ParseMultipartForm(500 << 20)
+	if err != nil {
+		log.Printf("[handleUploadProjectDatabase] Ошибка парсинга multipart формы: %v (Content-Type: %s, Content-Length: %s)",
+			err, contentType, r.Header.Get("Content-Length"))
+		s.writeJSONError(w, fmt.Sprintf("Ошибка парсинга формы: %v. Проверьте, что файл отправлен правильно.", err), http.StatusBadRequest)
+		return
+	}
+	log.Printf("[handleUploadProjectDatabase] Multipart форма успешно распарсена")
+
+	// Получаем файл из формы
+	log.Printf("[handleUploadProjectDatabase] Попытка получить файл из формы")
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		log.Printf("[handleUploadProjectDatabase] Ошибка получения файла из формы: %v. Доступные поля формы: %v", err, r.MultipartForm.Value)
+		s.writeJSONError(w, fmt.Sprintf("Ошибка получения файла: %v. Убедитесь, что файл отправлен с полем 'file'.", err), http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+	log.Printf("[handleUploadProjectDatabase] Файл получен: %s (размер: %d байт)", header.Filename, header.Size)
+	log.Printf("[handleUploadProjectDatabase] Информация об имени файла: длина=%d, байт=%d, первые 50 символов=%s", 
+		len(header.Filename), len([]byte(header.Filename)), header.Filename[:min(50, len(header.Filename))])
+
+	// Проверяем расширение файла
+	fileName := header.Filename
+	if !strings.HasSuffix(strings.ToLower(fileName), ".db") {
+		log.Printf("[handleUploadProjectDatabase] Ошибка: файл не имеет расширение .db: %s", fileName)
+		s.writeJSONError(w, fmt.Sprintf("Файл должен иметь расширение .db. Получен файл: %s", fileName), http.StatusBadRequest)
+		return
+	}
+
+	// Очищаем имя файла от потенциально опасных символов
+	// Заменяем недопустимые символы в имени файла
+	fileName = strings.ReplaceAll(fileName, "..", "_")
+	fileName = strings.ReplaceAll(fileName, "/", "_")
+	fileName = strings.ReplaceAll(fileName, "\\", "_")
+	fileName = strings.ReplaceAll(fileName, ":", "_")
+	fileName = strings.ReplaceAll(fileName, "*", "_")
+	fileName = strings.ReplaceAll(fileName, "?", "_")
+	fileName = strings.ReplaceAll(fileName, "\"", "_")
+	fileName = strings.ReplaceAll(fileName, "<", "_")
+	fileName = strings.ReplaceAll(fileName, ">", "_")
+	fileName = strings.ReplaceAll(fileName, "|", "_")
+
+	// Ограничиваем длину имени файла (максимум 255 символов)
+	if len(fileName) > 255 {
+		ext := filepath.Ext(fileName)
+		nameWithoutExt := strings.TrimSuffix(fileName, ext)
+		if len(nameWithoutExt) > 250 {
+			nameWithoutExt = nameWithoutExt[:250]
+		}
+		fileName = nameWithoutExt + ext
+	}
+
+	log.Printf("Received database file: %s (size: %d bytes, cleaned filename: %s)", header.Filename, header.Size, fileName)
+
+	// Создаем папку uploads, если её нет
+	uploadStartTime := time.Now() // Время начала загрузки
+	uploadsDir, err := EnsureUploadsDirectory(".")
+	if err != nil {
+		log.Printf("[handleUploadProjectDatabase] Ошибка создания папки uploads: %v", err)
+		s.writeJSONError(w, fmt.Sprintf("Ошибка создания папки uploads: %v", err), http.StatusInternalServerError)
+		return
+	}
+	log.Printf("[handleUploadProjectDatabase] Папка uploads проверена/создана: %s", uploadsDir)
+
+	// Сохраняем файл в data/uploads/
+	// Используем filepath.Clean для защиты от path traversal
+	filePath := filepath.Join(uploadsDir, fileName)
+	filePath = filepath.Clean(filePath)
+	
+	// Дополнительная проверка на path traversal - убеждаемся, что путь находится внутри uploadsDir
+	absUploadsDir, err := filepath.Abs(uploadsDir)
+	if err != nil {
+		log.Printf("[handleUploadProjectDatabase] Ошибка получения абсолютного пути uploadsDir: %v", err)
+		s.writeJSONError(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	absFilePath, err := filepath.Abs(filePath)
+	if err != nil {
+		log.Printf("[handleUploadProjectDatabase] Ошибка получения абсолютного пути filePath: %v", err)
+		s.writeJSONError(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	
+	// Проверяем, что файл находится внутри uploadsDir
+	if !strings.HasPrefix(absFilePath, absUploadsDir+string(filepath.Separator)) && absFilePath != absUploadsDir {
+		log.Printf("[handleUploadProjectDatabase] Ошибка безопасности: попытка path traversal. uploadsDir: %s, filePath: %s", absUploadsDir, absFilePath)
+		s.writeJSONError(w, "Invalid file path", http.StatusBadRequest)
+		return
+	}
+
+	// Проверяем, существует ли файл с таким именем
+	if _, err := os.Stat(filePath); err == nil {
+		// Файл уже существует, добавляем timestamp к имени
+		ext := filepath.Ext(fileName)
+		nameWithoutExt := strings.TrimSuffix(fileName, ext)
+		timestamp := time.Now().Format("20060102_150405")
+		oldFileName := fileName
+		fileName = fmt.Sprintf("%s_%s%s", nameWithoutExt, timestamp, ext)
+		filePath = filepath.Join(uploadsDir, fileName)
+		log.Printf("[handleUploadProjectDatabase] Файл с именем '%s' уже существует, переименован в '%s'", oldFileName, fileName)
+	}
+
+	// Создаем файл для сохранения
+	log.Printf("[handleUploadProjectDatabase] Создание файла для сохранения: %s", filePath)
+	dst, err := os.Create(filePath)
+	if err != nil {
+		log.Printf("[handleUploadProjectDatabase] Ошибка создания файла %s: %v", filePath, err)
+		s.writeJSONError(w, fmt.Sprintf("Ошибка создания файла: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer dst.Close()
+
+	// Копируем содержимое загруженного файла
+	copyStartTime := time.Now()
+	log.Printf("[handleUploadProjectDatabase] Начало копирования файла (размер: %d байт, ~%.2f MB)", header.Size, float64(header.Size)/(1024*1024))
+	bytesWritten, err := io.Copy(dst, file)
+	copyDuration := time.Since(copyStartTime)
+	if err != nil {
+		log.Printf("[handleUploadProjectDatabase] Ошибка копирования файла: %v (записано %d из %d байт)", err, bytesWritten, header.Size)
+		os.Remove(filePath) // Удаляем файл при ошибке
+		s.writeJSONError(w, fmt.Sprintf("Ошибка сохранения файла: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Вычисляем скорость загрузки (избегаем деления на ноль и Inf)
+	var speedMBps float64
+	nanos := float64(copyDuration.Nanoseconds())
+	if nanos > 0 {
+		// Используем наносекунды для более точного расчета
+		speedMBps = float64(bytesWritten) / (1024 * 1024) / (nanos / 1e9)
+		// Проверяем на разумные значения (не Inf и не NaN)
+		if !(speedMBps >= 0 && speedMBps < 1e10) {
+			// Если скорость неразумно высокая, показываем "очень быстро"
+			speedMBps = -1 // Специальное значение для "очень быстро"
+		}
+	} else {
+		speedMBps = 0 // Если время равно 0, скорость не определена
+	}
+
+	// Форматируем скорость для лога
+	var speedStr string
+	if speedMBps < 0 {
+		speedStr = "очень быстро"
+	} else if speedMBps > 0 {
+		speedStr = fmt.Sprintf("%.2f MB/s", speedMBps)
+	} else {
+		speedStr = "N/A"
+	}
+
+	log.Printf("[handleUploadProjectDatabase] Файл сохранен: %s (записано %d байт, ~%.2f MB, время: %v, скорость: %s)",
+		filePath, bytesWritten, float64(bytesWritten)/(1024*1024), copyDuration, speedStr)
+
+	// Проверяем, что файл не пустой
+	if bytesWritten == 0 {
+		log.Printf("[handleUploadProjectDatabase] Ошибка: файл пустой")
+		os.Remove(filePath)
+		s.writeJSONError(w, "Загруженный файл пустой", http.StatusBadRequest)
+		return
+	}
+
+	// Проверяем, что файл является валидным SQLite файлом
+	// SQLite файлы начинаются с заголовка "SQLite format 3\000"
+	dst.Close() // Закрываем файл перед проверкой
+	validationFile, err := os.Open(filePath)
+	if err != nil {
+		log.Printf("[handleUploadProjectDatabase] Ошибка открытия файла для валидации: %v", err)
+		os.Remove(filePath)
+		s.writeJSONError(w, fmt.Sprintf("Ошибка валидации файла: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer validationFile.Close()
+
+	fileHeader := make([]byte, 16)
+	n, err := validationFile.Read(fileHeader)
+	if err != nil && err != io.EOF {
+		log.Printf("[handleUploadProjectDatabase] Ошибка чтения заголовка файла: %v", err)
+		os.Remove(filePath)
+		s.writeJSONError(w, fmt.Sprintf("Ошибка чтения файла: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	if n < 16 {
+		log.Printf("[handleUploadProjectDatabase] Ошибка: файл слишком маленький для SQLite базы данных")
+		os.Remove(filePath)
+		s.writeJSONError(w, "Файл слишком маленький. Минимальный размер SQLite файла - 16 байт", http.StatusBadRequest)
+		return
+	}
+
+	// Проверяем SQLite заголовок
+	sqliteHeader := "SQLite format 3\x00"
+	if string(fileHeader) != sqliteHeader {
+		log.Printf("[handleUploadProjectDatabase] Ошибка: файл не является валидным SQLite файлом. Заголовок: %q (ожидается: %q)", string(fileHeader), sqliteHeader)
+		os.Remove(filePath)
+		s.writeJSONError(w, fmt.Sprintf("Файл не является валидным SQLite файлом. Заголовок файла: %q. Убедитесь, что вы загружаете файл базы данных SQLite.", string(fileHeader)), http.StatusBadRequest)
+		return
+	}
+	
+	// Дополнительная проверка безопасности: проверяем, что файл не является исполняемым
+	// Это защита от загрузки вредоносных файлов под видом SQLite
+	executableSignatures := [][]byte{
+		[]byte{0x7F, 0x45, 0x4C, 0x46}, // ELF (Linux executable)
+		[]byte{0x4D, 0x5A},             // PE/COFF (Windows executable)
+		[]byte{0xCA, 0xFE, 0xBA, 0xBE}, // Java class file
+		[]byte{0xFE, 0xED, 0xFA, 0xCE}, // Mach-O (macOS executable)
+		[]byte{0xCE, 0xFA, 0xED, 0xFE}, // Mach-O (macOS executable, little-endian)
+	}
+	
+	for _, sig := range executableSignatures {
+		if len(fileHeader) >= len(sig) {
+			match := true
+			for i := 0; i < len(sig); i++ {
+				if fileHeader[i] != sig[i] {
+					match = false
+					break
+				}
+			}
+			if match {
+				log.Printf("[handleUploadProjectDatabase] ОШИБКА БЕЗОПАСНОСТИ: файл похож на исполняемый (сигнатура: %x). Файл: %s, размер: %d байт", sig, fileName, header.Size)
+				os.Remove(filePath)
+				s.writeJSONError(w, "Файл не является валидным SQLite файлом. Обнаружена подозрительная сигнатура. Загрузка отклонена по соображениям безопасности.", http.StatusBadRequest)
+				return
+			}
+		}
+	}
+
+	log.Printf("[handleUploadProjectDatabase] Файл успешно валидирован как SQLite база данных (размер: %d байт, ~%.2f MB)",
+		bytesWritten, float64(bytesWritten)/(1024*1024))
+
+	// Проверяем размер файла - должен совпадать с заявленным
+	if header.Size > 0 && bytesWritten != header.Size {
+		sizeDiff := bytesWritten - header.Size
+		log.Printf("[handleUploadProjectDatabase] Предупреждение: размер записанного файла (%d байт) не совпадает с заявленным (%d байт), разница: %d байт",
+			bytesWritten, header.Size, sizeDiff)
+		// Это не критично, но стоит залогировать
+	}
+
+	// Парсим название из имени файла
+	suggestedName := ParseDatabaseNameFromFilename(fileName)
+	if suggestedName == "" {
+		// Если не удалось распарсить, используем имя файла без расширения
+		suggestedName = strings.TrimSuffix(fileName, filepath.Ext(fileName))
+	}
+
+	// Получаем описание из формы, если есть
+	description := r.FormValue("description")
+	if description == "" {
+		description = fmt.Sprintf("Загружено: %s", time.Now().Format("02.01.2006 15:04"))
+	}
+
+	// Проверяем, нужно ли автоматически создать базу данных
+	autoCreate := r.FormValue("auto_create") == "true"
+
+	totalDuration := time.Since(uploadStartTime)
+	log.Printf("[handleUploadProjectDatabase] Общее время обработки загрузки: %v", totalDuration)
+
+	// Вычисляем скорость загрузки для ответа
+	var uploadSpeedMBps float64
+	if totalDuration.Seconds() > 0 {
+		uploadSpeedMBps = float64(bytesWritten) / (1024 * 1024) / totalDuration.Seconds()
+	} else {
+		nanos := float64(totalDuration.Nanoseconds())
+		if nanos > 0 {
+			uploadSpeedMBps = float64(bytesWritten) / (1024 * 1024) / (nanos / 1e9)
+		}
+	}
+
+	// Формируем метрики загрузки
+	uploadMetrics := map[string]interface{}{
+		"start_time":      uploadStartTime.Format(time.RFC3339),
+		"duration_ms":     totalDuration.Milliseconds(),
+		"duration_sec":    totalDuration.Seconds(),
+		"speed_mbps":      uploadSpeedMBps,
+		"file_size_bytes": bytesWritten,
+		"file_size_mb":    float64(bytesWritten) / (1024 * 1024),
+	}
+
+	if autoCreate {
+		// Автоматически создаем базу данных
+		log.Printf("[handleUploadProjectDatabase] Автоматическое создание базы данных: название='%s', путь='%s'", suggestedName, filePath)
+		database, err := s.serviceDB.CreateProjectDatabase(projectID, suggestedName, filePath, description, header.Size)
+		if err != nil {
+			log.Printf("[handleUploadProjectDatabase] Ошибка создания базы данных в БД: %v (проект=%d, название='%s')", err, projectID, suggestedName)
+			s.writeJSONError(w, fmt.Sprintf("Ошибка создания базы данных: %v", err), http.StatusInternalServerError)
+			return
+		}
+		log.Printf("[handleUploadProjectDatabase] База данных успешно создана: ID=%d, название='%s'", database.ID, database.Name)
+		log.Printf("[handleUploadProjectDatabase] ✅ Успешно завершено: файл загружен и база данных создана (ID=%d, время: %v)",
+			database.ID, time.Since(uploadStartTime))
+
+		s.writeJSONResponse(w, map[string]interface{}{
+			"success":        true,
+			"message":        "База данных успешно загружена и добавлена",
+			"database":       database,
+			"file_path":      filePath,
+			"file_name":      fileName,
+			"suggested_name": suggestedName,
+			"upload_metrics": uploadMetrics,
+		}, http.StatusCreated)
+	} else {
+		// Возвращаем информацию о файле для подтверждения
+		log.Printf("[handleUploadProjectDatabase] ✅ Успешно завершено: файл загружен, ожидается подтверждение (время: %v)", time.Since(uploadStartTime))
+		s.writeJSONResponse(w, map[string]interface{}{
+			"success":        true,
+			"message":        "Файл успешно загружен",
+			"file_path":      filePath,
+			"file_name":      fileName,
+			"suggested_name": suggestedName,
+			"file_size":      header.Size,
+			"description":    description,
+			"upload_metrics": uploadMetrics,
+		}, http.StatusOK)
+	}
+}
+
+// handleStartClientNormalization запускает нормализацию для клиента
+func (s *Server) handleStartClientNormalization(w http.ResponseWriter, r *http.Request, clientID, projectID int) {
+	s.normalizerMutex.Lock()
+	defer s.normalizerMutex.Unlock()
+
+	if s.normalizerRunning {
+		s.writeJSONError(w, "Normalization is already running", http.StatusBadRequest)
+		return
+	}
+
+	// Читаем параметры из запроса
+	var req struct {
+		DatabasePath string `json:"database_path"`
+		AllActive    bool   `json:"all_active"`
+		UseKpved     bool   `json:"use_kpved"`
+		UseOkpd2     bool   `json:"use_okpd2"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		// Если тело пустое, используем значения по умолчанию
+		req.AllActive = false
+		req.UseKpved = false
+		req.UseOkpd2 = false
+	}
+
+	// Проверяем существование проекта
+	project, err := s.serviceDB.GetClientProject(projectID)
+	if err != nil {
+		s.writeJSONError(w, "Project not found", http.StatusNotFound)
+		return
+	}
+
+	if project.ClientID != clientID {
+		s.writeJSONError(w, "Project does not belong to this client", http.StatusBadRequest)
+		return
+	}
+
+	var databasesToProcess []*database.ProjectDatabase
+
+	if req.AllActive {
+		// Получаем все активные БД проекта
+		databases, err := s.serviceDB.GetProjectDatabases(projectID, true)
+		if err != nil {
+			s.writeJSONError(w, fmt.Sprintf("Failed to get project databases: %v", err), http.StatusInternalServerError)
+			return
+		}
+		if len(databases) == 0 {
+			s.writeJSONError(w, "No active databases found for this project", http.StatusBadRequest)
+			return
+		}
+		databasesToProcess = databases
+	} else {
+		// Используем конкретную БД
+		if req.DatabasePath == "" {
+			s.writeJSONError(w, "database_path is required when all_active is false", http.StatusBadRequest)
+			return
+		}
+
+		// Получаем все БД проекта для проверки принадлежности
+		allDatabases, err := s.serviceDB.GetProjectDatabases(projectID, false)
+		if err != nil {
+			s.writeJSONError(w, fmt.Sprintf("Failed to get project databases: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		var foundDB *database.ProjectDatabase
+		for _, db := range allDatabases {
+			if db.FilePath == req.DatabasePath {
+				foundDB = db
+				break
+			}
+		}
+
+		if foundDB == nil {
+			s.writeJSONError(w, "Database does not belong to this project", http.StatusBadRequest)
+			return
+		}
+
+		databasesToProcess = []*database.ProjectDatabase{foundDB}
+	}
+
+	// Запускаем нормализацию для всех выбранных БД
 	s.normalizerRunning = true
 	go func() {
 		defer func() {
 			s.normalizerMutex.Lock()
 			s.normalizerRunning = false
 			s.normalizerMutex.Unlock()
-			sourceDB.Close() // Закрываем БД после завершения
 			log.Printf("Normalization completed for project %d", projectID)
 		}()
 
-		_, err := clientNormalizer.ProcessWithClientBenchmarks(items)
-		if err != nil {
-			select {
-			case s.normalizerEvents <- fmt.Sprintf("Ошибка нормализации: %v", err):
-			default:
+		for _, projectDB := range databasesToProcess {
+			// Проверяем, не нужно ли остановить нормализацию
+			s.normalizerMutex.RLock()
+			shouldStop := !s.normalizerRunning
+			s.normalizerMutex.RUnlock()
+			if shouldStop {
+				log.Printf("Normalization stopped, skipping database %s", projectDB.FilePath)
+				break
 			}
-			log.Printf("Ошибка клиентской нормализации: %v", err)
+
+			// Создаем сессию нормализации для этой базы данных (приоритет 0 по умолчанию, таймаут 1 час)
+			sessionID, err := s.serviceDB.CreateNormalizationSession(projectDB.ID, 0, 3600)
+			if err != nil {
+				select {
+				case s.normalizerEvents <- fmt.Sprintf("Ошибка создания сессии для БД %s: %v", projectDB.FilePath, err):
+				default:
+				}
+				log.Printf("Failed to create normalization session for database %s: %v", projectDB.FilePath, err)
+				continue
+			}
+
+			// Обновляем last_used_at
+			s.serviceDB.UpdateProjectDatabaseLastUsed(projectDB.ID)
+
+			// Открываем подключение к базе данных
+			sourceDB, err := database.NewDB(projectDB.FilePath)
+			if err != nil {
+				// Обновляем сессию как failed
+				s.serviceDB.UpdateNormalizationSession(sessionID, "failed", nil)
+				select {
+				case s.normalizerEvents <- fmt.Sprintf("Ошибка открытия БД %s: %v", projectDB.FilePath, err):
+				default:
+				}
+				log.Printf("Failed to open database %s: %v", projectDB.FilePath, err)
+				continue
+			}
+
+			// Проверяем тип проекта и выбираем соответствующий нормализатор
+			if project.ProjectType == "counterparty" {
+				// Нормализация контрагентов
+				// Получаем контрагентов из справочника "Контрагенты"
+				uploads, err := sourceDB.GetAllUploads()
+				if err != nil {
+					sourceDB.Close()
+					select {
+					case s.normalizerEvents <- fmt.Sprintf("Ошибка получения выгрузок из %s: %v", projectDB.FilePath, err):
+					default:
+					}
+					log.Printf("Failed to get uploads from %s: %v", projectDB.FilePath, err)
+					continue
+				}
+
+				var counterparties []*database.CatalogItem
+				for _, upload := range uploads {
+					items, _, err := sourceDB.GetCatalogItemsByUpload(upload.ID, []string{"Контрагенты"}, 0, 0)
+					if err != nil {
+						log.Printf("Failed to get counterparties from upload %d: %v", upload.ID, err)
+						continue
+					}
+					counterparties = append(counterparties, items...)
+				}
+
+				if len(counterparties) == 0 {
+					select {
+					case s.normalizerEvents <- fmt.Sprintf("Контрагенты не найдены в БД %s", projectDB.Name):
+					default:
+					}
+					sourceDB.Close()
+					continue
+				}
+
+				log.Printf("Starting counterparty normalization for project %d with %d counterparties from %s", projectID, len(counterparties), projectDB.FilePath)
+				select {
+				case s.normalizerEvents <- fmt.Sprintf("Начало нормализации контрагентов БД: %s (%d записей)", projectDB.Name, len(counterparties)):
+				default:
+				}
+
+				// Создаем нормализатор контрагентов
+				counterpartyNormalizer := normalization.NewCounterpartyNormalizer(s.serviceDB, clientID, projectID, s.normalizerEvents)
+
+				// Настраиваем обогащение, если доступно
+				if s.enrichmentFactory != nil && s.config.Enrichment != nil && s.config.Enrichment.Enabled {
+					counterpartyNormalizer.SetEnrichmentFactory(s.enrichmentFactory)
+					counterpartyNormalizer.SetEnrichmentConfig(&normalization.EnrichmentConfig{
+						Enabled:         s.config.Enrichment.Enabled,
+						AutoEnrich:      s.config.Enrichment.AutoEnrich,
+						MinQualityScore: s.config.Enrichment.MinQualityScore,
+					})
+				}
+
+				// Запускаем нормализацию контрагентов
+				result, err := counterpartyNormalizer.ProcessNormalization(counterparties)
+				if err != nil {
+					select {
+					case s.normalizerEvents <- fmt.Sprintf("Ошибка нормализации контрагентов БД %s: %v", projectDB.FilePath, err):
+					default:
+					}
+					log.Printf("Ошибка нормализации контрагентов для %s: %v", projectDB.FilePath, err)
+				} else {
+					select {
+					case s.normalizerEvents <- fmt.Sprintf("Нормализация контрагентов БД %s завершена: обработано %d, найдено эталонов %d, дозаполнено %d, групп дублей %d",
+						projectDB.Name, result.TotalProcessed, result.BenchmarkMatches, result.EnrichedCount, result.DuplicateGroups):
+					default:
+					}
+					log.Printf("Нормализация контрагентов завершена: обработано %d, найдено эталонов %d, дозаполнено %d, групп дублей %d",
+						result.TotalProcessed, result.BenchmarkMatches, result.EnrichedCount, result.DuplicateGroups)
+				}
+			} else {
+				// Нормализация номенклатуры (существующая логика)
+				// Получаем все записи из catalog_items
+				items, err := sourceDB.GetAllCatalogItems()
+				if err != nil {
+					sourceDB.Close()
+					select {
+					case s.normalizerEvents <- fmt.Sprintf("Ошибка чтения данных из %s: %v", projectDB.FilePath, err):
+					default:
+					}
+					log.Printf("Failed to read data from %s: %v", projectDB.FilePath, err)
+					continue
+				}
+
+				log.Printf("Starting normalization for project %d with %d items from %s", projectID, len(items), projectDB.FilePath)
+				select {
+				case s.normalizerEvents <- fmt.Sprintf("Начало нормализации БД: %s (%d записей)", projectDB.Name, len(items)):
+				default:
+				}
+
+				// Создаем клиентский нормализатор
+				clientNormalizer := normalization.NewClientNormalizerWithConfig(clientID, projectID, sourceDB, s.serviceDB, s.normalizerEvents, s.workerConfigManager)
+
+				// Устанавливаем sessionID для нормализатора
+				clientNormalizer.SetSessionID(sessionID)
+
+				// Проверяем статус сессии перед запуском
+				session, err := s.serviceDB.GetNormalizationSession(sessionID)
+				if err != nil || session == nil || session.Status != "running" {
+					log.Printf("Session %d is not running, skipping normalization", sessionID)
+					sourceDB.Close()
+					continue
+				}
+
+				// Запускаем нормализацию с периодической проверкой остановки
+				// Обновляем активность сессии перед началом
+				s.serviceDB.UpdateSessionActivity(sessionID)
+
+				// Запускаем горутину для периодического обновления активности
+				activityTicker := time.NewTicker(30 * time.Second)
+				activityDone := make(chan bool)
+				go func() {
+					for {
+						select {
+						case <-activityTicker.C:
+							s.serviceDB.UpdateSessionActivity(sessionID)
+						case <-activityDone:
+							return
+						}
+					}
+				}()
+
+				_, err = clientNormalizer.ProcessWithClientBenchmarks(items)
+				activityTicker.Stop()
+				activityDone <- true
+				finishedAt := time.Now()
+
+				// Проверяем, не была ли сессия остановлена
+				session, _ = s.serviceDB.GetNormalizationSession(sessionID)
+				if session != nil && session.Status == "stopped" {
+					log.Printf("Session %d was stopped during normalization", sessionID)
+					sourceDB.Close()
+					continue
+				}
+
+				if err != nil {
+					// Обновляем сессию как failed
+					s.serviceDB.UpdateNormalizationSession(sessionID, "failed", &finishedAt)
+					select {
+					case s.normalizerEvents <- fmt.Sprintf("Ошибка нормализации БД %s: %v", projectDB.FilePath, err):
+					default:
+					}
+					log.Printf("Ошибка клиентской нормализации для %s: %v", projectDB.FilePath, err)
+				} else {
+					// Обновляем сессию как completed
+					s.serviceDB.UpdateNormalizationSession(sessionID, "completed", &finishedAt)
+					select {
+					case s.normalizerEvents <- fmt.Sprintf("Нормализация БД %s завершена успешно", projectDB.Name):
+					default:
+					}
+
+					// Классификация КПВЭД и ОКПД2 после нормализации
+					// Открываем normalized_data для классификации
+					normalizedDBPath := filepath.Join(filepath.Dir(projectDB.FilePath), "normalized_"+filepath.Base(projectDB.FilePath))
+					if _, err := os.Stat(normalizedDBPath); err == nil {
+						normalizedDB, err := database.NewDB(normalizedDBPath)
+						if err == nil {
+							defer normalizedDB.Close()
+
+							// КПВЭД классификация
+							if req.UseKpved && s.hierarchicalClassifier != nil {
+								s.classifyKpvedForDatabase(normalizedDB, projectDB.Name)
+							}
+
+							// ОКПД2 классификация
+							if req.UseOkpd2 {
+								s.classifyOkpd2ForDatabase(normalizedDB, projectDB.Name)
+							}
+						}
+					}
+				}
+			}
+
+			sourceDB.Close()
 		}
 	}()
 
-	s.writeJSONResponse(w, map[string]interface{}{
-		"status":        "started",
-		"message":       "Normalization started",
-		"database_path": req.DatabasePath,
-		"items_count":   len(items),
-	}, http.StatusOK)
+	response := map[string]interface{}{
+		"status":     "started",
+		"message":    "Normalization started",
+		"databases":  len(databasesToProcess),
+		"all_active": req.AllActive,
+	}
+
+	if !req.AllActive && len(databasesToProcess) > 0 {
+		response["database_path"] = databasesToProcess[0].FilePath
+	}
+
+	s.writeJSONResponse(w, response, http.StatusOK)
 }
 
 // handleStopClientNormalization останавливает нормализацию для клиента
@@ -6283,15 +7673,257 @@ func (s *Server) handleStopClientNormalization(w http.ResponseWriter, r *http.Re
 func (s *Server) handleGetClientNormalizationStatus(w http.ResponseWriter, r *http.Request, clientID, projectID int) {
 	s.normalizerMutex.RLock()
 	isRunning := s.normalizerRunning
+	startTime := s.normalizerStartTime
+	processed := s.normalizerProcessed
+	success := s.normalizerSuccess
+	errors := s.normalizerErrors
 	s.normalizerMutex.RUnlock()
 
+	// Получаем события нормализации (последние 50)
+	var logs []string
+	for i := 0; i < 50; i++ {
+		select {
+		case event := <-s.normalizerEvents:
+			logs = append(logs, event)
+		default:
+			goto done
+		}
+	}
+done:
+
+	// Вычисляем прогресс и время
+	var progress float64
+	var elapsedTime string
+	var rate float64
+	var currentStep string
+
+	if isRunning {
+		if startTime.IsZero() {
+			currentStep = "Инициализация..."
+		} else {
+			elapsed := time.Since(startTime)
+			elapsedTime = elapsed.Round(time.Second).String()
+			if processed > 0 && elapsed.Seconds() > 0 {
+				rate = float64(processed) / elapsed.Seconds()
+			}
+			currentStep = "Нормализация в процессе"
+			if len(logs) > 0 {
+				currentStep = logs[len(logs)-1]
+			}
+		}
+	} else {
+		if processed > 0 {
+			currentStep = "Нормализация завершена"
+			// Вычисляем скорость для завершенной нормализации
+			if !startTime.IsZero() {
+				elapsed := time.Since(startTime)
+				elapsedTime = elapsed.Round(time.Second).String()
+				if elapsed.Seconds() > 0 {
+					rate = float64(processed) / elapsed.Seconds()
+				}
+			}
+		} else {
+			currentStep = "Не запущено"
+		}
+	}
+
+	// Получаем общее количество для расчета прогресса
+	var total int
+	project, err := s.serviceDB.GetClientProject(projectID)
+	if err == nil {
+		if project.ProjectType == "counterparty" {
+			// Для контрагентов получаем статистику
+			stats, err := s.serviceDB.GetNormalizedCounterpartyStats(projectID)
+			if err == nil {
+				if totalCount, ok := stats["total_count"].(int); ok {
+					total = totalCount
+				}
+			}
+		} else {
+			// Для номенклатуры получаем из БД проекта
+			databases, err := s.serviceDB.GetProjectDatabases(projectID, true)
+			if err == nil && len(databases) > 0 {
+				// Берем первую активную БД для подсчета
+				db, err := database.NewDB(databases[0].FilePath)
+				if err == nil {
+					items, err := db.GetAllCatalogItems()
+					if err == nil {
+						total = len(items)
+					}
+					db.Close()
+				}
+			}
+		}
+	}
+
+	if total > 0 {
+		progress = float64(processed) / float64(total) * 100
+	}
+
 	response := map[string]interface{}{
-		"is_running": isRunning,
-		"client_id":  clientID,
-		"project_id": projectID,
+		"isRunning":   isRunning,
+		"progress":    progress,
+		"processed":   processed,
+		"total":       total,
+		"success":     success,
+		"errors":      errors,
+		"currentStep": currentStep,
+		"logs":        logs,
+		"startTime":   startTime.Format(time.RFC3339),
+		"elapsedTime": elapsedTime,
+		"rate":        rate,
+		"client_id":   clientID,
+		"project_id":  projectID,
 	}
 
 	s.writeJSONResponse(w, response, http.StatusOK)
+}
+
+// handleGetNormalizationSessions получает список сессий нормализации для проекта
+func (s *Server) handleGetNormalizationSessions(w http.ResponseWriter, r *http.Request, clientID, projectID int) {
+	// Получаем все базы данных проекта
+	databases, err := s.serviceDB.GetProjectDatabases(projectID, false)
+	if err != nil {
+		s.writeJSONError(w, "Failed to get project databases", http.StatusInternalServerError)
+		return
+	}
+
+	var allSessions []map[string]interface{}
+	for _, db := range databases {
+		session, err := s.serviceDB.GetLastNormalizationSession(db.ID)
+		if err == nil && session != nil {
+			sessionData := map[string]interface{}{
+				"id":                  session.ID,
+				"project_database_id": session.ProjectDatabaseID,
+				"database_name":       db.Name,
+				"database_path":       db.FilePath,
+				"started_at":          session.StartedAt.Format(time.RFC3339),
+				"status":              session.Status,
+				"priority":            session.Priority,
+				"timeout_seconds":     session.TimeoutSeconds,
+				"last_activity_at":    session.LastActivityAt.Format(time.RFC3339),
+			}
+			if session.FinishedAt != nil {
+				sessionData["finished_at"] = session.FinishedAt.Format(time.RFC3339)
+			}
+			allSessions = append(allSessions, sessionData)
+		}
+	}
+
+	// Также получаем все активные сессии
+	runningSessions, err := s.serviceDB.GetRunningSessions()
+	if err == nil {
+		for _, session := range runningSessions {
+			// Проверяем, принадлежит ли сессия этому проекту
+			for _, db := range databases {
+				if session.ProjectDatabaseID == db.ID {
+					// Уже добавлена выше
+					break
+				}
+			}
+		}
+	}
+
+	s.writeJSONResponse(w, map[string]interface{}{
+		"sessions": allSessions,
+		"total":    len(allSessions),
+	}, http.StatusOK)
+}
+
+// handleUpdateSessionPriority обновляет приоритет сессии
+func (s *Server) handleUpdateSessionPriority(w http.ResponseWriter, r *http.Request, clientID, projectID int) {
+	var req struct {
+		SessionID int `json:"session_id"`
+		Priority  int `json:"priority"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeJSONError(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Проверяем, что сессия принадлежит проекту
+	session, err := s.serviceDB.GetNormalizationSession(req.SessionID)
+	if err != nil || session == nil {
+		s.writeJSONError(w, "Session not found", http.StatusNotFound)
+		return
+	}
+
+	// Проверяем, что база данных принадлежит проекту
+	databases, err := s.serviceDB.GetProjectDatabases(projectID, false)
+	if err != nil {
+		s.writeJSONError(w, "Failed to get project databases", http.StatusInternalServerError)
+		return
+	}
+
+	found := false
+	for _, db := range databases {
+		if db.ID == session.ProjectDatabaseID {
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		s.writeJSONError(w, "Session does not belong to this project", http.StatusForbidden)
+		return
+	}
+
+	// Обновляем приоритет
+	err = s.serviceDB.UpdateSessionPriority(req.SessionID, req.Priority)
+	if err != nil {
+		s.writeJSONError(w, fmt.Sprintf("Failed to update priority: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	s.writeJSONResponse(w, map[string]interface{}{
+		"success":    true,
+		"session_id": req.SessionID,
+		"priority":   req.Priority,
+	}, http.StatusOK)
+}
+
+// handleStopNormalizationSession останавливает конкретную сессию нормализации
+func (s *Server) handleStopNormalizationSession(w http.ResponseWriter, r *http.Request, clientID, projectID, sessionID int) {
+	// Проверяем, что сессия принадлежит проекту
+	session, err := s.serviceDB.GetNormalizationSession(sessionID)
+	if err != nil || session == nil {
+		s.writeJSONError(w, "Session not found", http.StatusNotFound)
+		return
+	}
+
+	// Проверяем, что база данных принадлежит проекту
+	databases, err := s.serviceDB.GetProjectDatabases(projectID, false)
+	if err != nil {
+		s.writeJSONError(w, "Failed to get project databases", http.StatusInternalServerError)
+		return
+	}
+
+	found := false
+	for _, db := range databases {
+		if db.ID == session.ProjectDatabaseID {
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		s.writeJSONError(w, "Session does not belong to this project", http.StatusForbidden)
+		return
+	}
+
+	// Останавливаем сессию
+	err = s.serviceDB.StopNormalizationSession(sessionID)
+	if err != nil {
+		s.writeJSONError(w, fmt.Sprintf("Failed to stop session: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	s.writeJSONResponse(w, map[string]interface{}{
+		"success":    true,
+		"session_id": sessionID,
+		"message":    "Session stopped successfully",
+	}, http.StatusOK)
 }
 
 // handleGetClientNormalizationStats получает статистику нормализации для клиента
@@ -6300,7 +7932,13 @@ func (s *Server) handleGetClientNormalizationStats(w http.ResponseWriter, r *htt
 	isRunning := s.normalizerRunning
 	s.normalizerMutex.RUnlock()
 
-	// Получаем статистику из БД (упрощенная версия)
+	// Получаем проект для определения типа
+	project, err := s.serviceDB.GetClientProject(projectID)
+	if err != nil {
+		s.writeJSONError(w, "Project not found", http.StatusNotFound)
+		return
+	}
+
 	stats := map[string]interface{}{
 		"is_running":        isRunning,
 		"total_processed":   0,
@@ -6308,6 +7946,55 @@ func (s *Server) handleGetClientNormalizationStats(w http.ResponseWriter, r *htt
 		"benchmark_matches": 0,
 		"ai_enhanced":       0,
 		"basic_normalized":  0,
+	}
+
+	// Если проект типа "counterparty", получаем статистику по контрагентам
+	if project.ProjectType == "counterparty" {
+		counterpartyStats, err := s.serviceDB.GetNormalizedCounterpartyStats(projectID)
+		if err == nil {
+			stats["counterparty_stats"] = counterpartyStats
+			stats["total_processed"] = counterpartyStats["total_count"]
+			if withBenchmark, ok := counterpartyStats["with_benchmark"].(int); ok {
+				stats["benchmark_matches"] = withBenchmark
+			}
+			if enriched, ok := counterpartyStats["enriched"].(int); ok {
+				stats["enriched_count"] = enriched
+			}
+		}
+
+		// Получаем статистику по дубликатам
+		databases, err := s.serviceDB.GetProjectDatabases(projectID, true)
+		if err == nil && len(databases) > 0 {
+			var allCounterparties []*database.CatalogItem
+			for _, dbInfo := range databases {
+				if !dbInfo.IsActive {
+					continue
+				}
+				db, err := database.NewDB(dbInfo.FilePath)
+				if err != nil {
+					continue
+				}
+				uploads, err := db.GetAllUploads()
+				if err != nil {
+					db.Close()
+					continue
+				}
+				for _, upload := range uploads {
+					items, _, err := db.GetCatalogItemsByUpload(upload.ID, []string{"Контрагенты"}, 0, 0)
+					if err == nil {
+						allCounterparties = append(allCounterparties, items...)
+					}
+				}
+				db.Close()
+			}
+
+			if len(allCounterparties) > 0 {
+				duplicateAnalyzer := normalization.NewCounterpartyDuplicateAnalyzer()
+				duplicateGroups := duplicateAnalyzer.AnalyzeDuplicates(allCounterparties)
+				summary := duplicateAnalyzer.GetDuplicateSummary(duplicateGroups)
+				stats["duplicate_stats"] = summary
+			}
+		}
 	}
 
 	s.writeJSONResponse(w, stats, http.StatusOK)
@@ -6329,6 +8016,179 @@ func (s *Server) handleQualityStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSONResponse(w, stats, http.StatusOK)
+}
+
+// handleGetClientNormalizationGroups возвращает группы нормализации для базы данных проекта
+func (s *Server) handleGetClientNormalizationGroups(w http.ResponseWriter, r *http.Request, clientID, projectID int) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Получаем параметры запроса
+	query := r.URL.Query()
+	dbIDStr := query.Get("db_id")
+
+	if dbIDStr == "" {
+		s.writeJSONError(w, "db_id parameter is required", http.StatusBadRequest)
+		return
+	}
+
+	dbID, err := strconv.Atoi(dbIDStr)
+	if err != nil {
+		s.writeJSONError(w, "Invalid db_id parameter", http.StatusBadRequest)
+		return
+	}
+
+	// Получаем информацию о базе данных
+	databases, err := s.serviceDB.GetProjectDatabases(projectID, false)
+	if err != nil {
+		s.writeJSONError(w, "Failed to get project databases", http.StatusInternalServerError)
+		return
+	}
+
+	var targetDB *database.ProjectDatabase
+	for _, db := range databases {
+		if db.ID == dbID {
+			targetDB = db
+			break
+		}
+	}
+
+	if targetDB == nil {
+		s.writeJSONError(w, "Database not found", http.StatusNotFound)
+		return
+	}
+
+	// Получаем последнюю сессию нормализации для этой базы
+	session, err := s.serviceDB.GetLastNormalizationSession(dbID)
+	if err != nil {
+		s.writeJSONError(w, fmt.Sprintf("Failed to get normalization session: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	if session == nil {
+		// Нет сессий для этой базы - возвращаем пустой список
+		s.writeJSONResponse(w, map[string]interface{}{
+			"groups":     []interface{}{},
+			"total":      0,
+			"page":       1,
+			"limit":      20,
+			"totalPages": 0,
+		}, http.StatusOK)
+		return
+	}
+
+	// Открываем проектную БД
+	projectDB, err := database.NewDB(targetDB.FilePath)
+	if err != nil {
+		s.writeJSONError(w, fmt.Sprintf("Failed to open project database: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer projectDB.Close()
+
+	// Получаем параметры пагинации
+	pageStr := query.Get("page")
+	limitStr := query.Get("limit")
+	page := 1
+	limit := 20
+
+	if pageStr != "" {
+		if p, err := strconv.Atoi(pageStr); err == nil && p > 0 {
+			page = p
+		}
+	}
+
+	if limitStr != "" {
+		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 && l <= 100 {
+			limit = l
+		}
+	}
+
+	offset := (page - 1) * limit
+
+	// Строим SQL запрос с фильтрацией по session_id
+	baseQuery := `
+		SELECT normalized_name, normalized_reference, category, COUNT(*) as merged_count,
+		       MAX(kpved_code) as kpved_code, MAX(kpved_name) as kpved_name, 
+		       AVG(kpved_confidence) as kpved_confidence, MAX(created_at) as last_normalized_at
+		FROM normalized_data
+		WHERE normalization_session_id = ?
+		GROUP BY normalized_name, normalized_reference, category
+		ORDER BY merged_count DESC, normalized_name ASC
+		LIMIT ? OFFSET ?
+	`
+
+	countQuery := `
+		SELECT COUNT(*) FROM (
+			SELECT normalized_name, category
+			FROM normalized_data
+			WHERE normalization_session_id = ?
+			GROUP BY normalized_name, category
+		)
+	`
+
+	// Получаем общее количество групп
+	var totalGroups int
+	err = projectDB.QueryRow(countQuery, session.ID).Scan(&totalGroups)
+	if err != nil {
+		log.Printf("Ошибка получения количества групп: %v", err)
+		s.writeJSONError(w, "Failed to count groups", http.StatusInternalServerError)
+		return
+	}
+
+	// Получаем группы
+	rows, err := projectDB.Query(baseQuery, session.ID, limit, offset)
+	if err != nil {
+		log.Printf("Ошибка выполнения запроса групп: %v", err)
+		s.writeJSONError(w, "Failed to fetch groups", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type Group struct {
+		NormalizedName      string   `json:"normalized_name"`
+		NormalizedReference string   `json:"normalized_reference"`
+		Category            string   `json:"category"`
+		MergedCount         int      `json:"merged_count"`
+		KpvedCode           *string  `json:"kpved_code,omitempty"`
+		KpvedName           *string  `json:"kpved_name,omitempty"`
+		KpvedConfidence     *float64 `json:"kpved_confidence,omitempty"`
+		LastNormalizedAt    *string  `json:"last_normalized_at,omitempty"`
+	}
+
+	groups := []Group{}
+	for rows.Next() {
+		var g Group
+		var lastNormalizedAt sql.NullString
+		if err := rows.Scan(&g.NormalizedName, &g.NormalizedReference, &g.Category, &g.MergedCount,
+			&g.KpvedCode, &g.KpvedName, &g.KpvedConfidence, &lastNormalizedAt); err != nil {
+			log.Printf("Ошибка сканирования группы: %v", err)
+			continue
+		}
+		if lastNormalizedAt.Valid && lastNormalizedAt.String != "" {
+			g.LastNormalizedAt = &lastNormalizedAt.String
+		}
+		groups = append(groups, g)
+	}
+
+	if err := rows.Err(); err != nil {
+		log.Printf("Ошибка при итерации по группам: %v", err)
+	}
+
+	// Вычисляем общее количество страниц
+	totalPages := (totalGroups + limit - 1) / limit
+
+	response := map[string]interface{}{
+		"groups":     groups,
+		"total":      totalGroups,
+		"page":       page,
+		"limit":      limit,
+		"totalPages": totalPages,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
 
 // handleMonitoringMetrics возвращает общую статистику производительности
@@ -7183,6 +9043,7 @@ func (s *Server) handleKpvedClassifyTest(w http.ResponseWriter, r *http.Request)
 	// Читаем тело запроса
 	var req struct {
 		NormalizedName string `json:"normalized_name"`
+		Model          string `json:"model"` // Опциональный параметр для указания модели
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
@@ -7209,8 +9070,11 @@ func (s *Server) handleKpvedClassifyTest(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Получаем модель из WorkerConfigManager
-	model := s.getModelFromConfig()
+	// Получаем модель: из запроса или из конфигурации
+	model := req.Model
+	if model == "" {
+		model = s.getModelFromConfig()
+	}
 
 	// Создаем временный классификатор для теста
 	classifier := normalization.NewKpvedClassifier(s.normalizedDB, apiKey, "КПВЭД.txt", model)
@@ -7338,6 +9202,7 @@ func (s *Server) handleKpvedClassifyHierarchical(w http.ResponseWriter, r *http.
 	var req struct {
 		NormalizedName string `json:"normalized_name"`
 		Category       string `json:"category"`
+		Model          string `json:"model"` // Опциональный параметр для указания модели
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
@@ -7354,14 +9219,24 @@ func (s *Server) handleKpvedClassifyHierarchical(w http.ResponseWriter, r *http.
 		req.Category = "общее"
 	}
 
-	// Получаем API ключ и модель из WorkerConfigManager
-	apiKey, model, err := s.workerConfigManager.GetModelAndAPIKey()
-	if err != nil {
-		log.Printf("[KPVED Test] Error getting API key and model: %v", err)
-		http.Error(w, fmt.Sprintf("AI API key not configured: %v", err), http.StatusServiceUnavailable)
+	// Получаем API ключ
+	apiKey := os.Getenv("ARLIAI_API_KEY")
+	if apiKey == "" {
+		http.Error(w, "AI API key not configured", http.StatusServiceUnavailable)
 		return
 	}
-	log.Printf("[KPVED Test] Using API key and model: %s", model)
+
+	// Получаем модель: из запроса или из WorkerConfigManager
+	model := req.Model
+	if model == "" {
+		var err error
+		_, model, err = s.workerConfigManager.GetModelAndAPIKey()
+		if err != nil {
+			log.Printf("[KPVED Test] Error getting model from config: %v, using default", err)
+			model = "GLM-4.5-Air" // Дефолтная модель
+		}
+	}
+	log.Printf("[KPVED Test] Using model: %s", model)
 
 	// Создаем AI клиент
 	aiClient := nomenclature.NewAIClient(apiKey, model)
@@ -7599,8 +9474,8 @@ func (s *Server) handleKpvedReclassifyHierarchical(w http.ResponseWriter, r *htt
 	// Функция для retry UPDATE запросов с экспоненциальной задержкой и таймаутом
 	retryUpdate := func(query string, args ...interface{}) (sql.Result, error) {
 		maxRetries := 5
-		baseDelay := 50 * time.Millisecond
-		queryTimeout := 10 * time.Second // Таймаут для каждого запроса
+		baseDelay := 10 * time.Millisecond // Минимальная задержка для retry БД (не связано с Arliai API)
+		queryTimeout := 10 * time.Second   // Таймаут для каждого запроса
 
 		for attempt := 0; attempt < maxRetries; attempt++ {
 			// Создаем context с таймаутом для запроса
@@ -7801,45 +9676,28 @@ func (s *Server) handleKpvedReclassifyHierarchical(w http.ResponseWriter, r *htt
 				if err != nil {
 					// Проверяем тип ошибки
 					errStr := err.Error()
-					isRateLimit := strings.Contains(errStr, "rate limit") ||
-						strings.Contains(errStr, "too many requests") ||
-						strings.Contains(errStr, "429") ||
-						strings.Contains(errStr, "quota exceeded") ||
-						strings.Contains(errStr, "exceeded the maximum number of parallel requests")
-
 					isCircuitBreakerOpen := strings.Contains(errStr, "circuit breaker is open")
 
-					// Если circuit breaker открыт, ждем пока он закроется
+					// Если circuit breaker открыт, ждем его восстановления
 					if isCircuitBreakerOpen {
-						log.Printf("[KPVED Worker %d] Circuit breaker is open, waiting for recovery (task: '%s')...", workerID, task.normalizedName)
-						// Ждем 5 секунд перед повторной попыткой
-						time.Sleep(5 * time.Second)
-						// Пытаемся еще раз
-						retryResult, retryErr := hierarchicalClassifier.Classify(task.normalizedName, task.category)
-						if retryErr == nil {
-							// Успешно после retry - используем результат
-							result = retryResult
-							err = nil
-						} else {
-							errStr = retryErr.Error()
-							isCircuitBreakerOpen = strings.Contains(errStr, "circuit breaker is open")
-							if isCircuitBreakerOpen {
-								log.Printf("[KPVED Worker %d] Circuit breaker still open after retry, waiting 10 more seconds...", workerID)
-								time.Sleep(10 * time.Second)
-								// Последняя попытка
-								finalResult, finalErr := hierarchicalClassifier.Classify(task.normalizedName, task.category)
-								if finalErr == nil {
-									// Успешно после последней попытки
-									result = finalResult
-									err = nil
-								} else {
-									// Все попытки неудачны
-									err = finalErr
-								}
+						log.Printf("[KPVED Worker %d] Circuit breaker is open (task: '%s'), waiting for recovery...", workerID, task.normalizedName)
+						
+						// Ждем восстановления circuit breaker (максимум 30 секунд)
+						recovered := hierarchicalClassifier.WaitForCircuitBreakerRecovery(30 * time.Second)
+						if recovered {
+							log.Printf("[KPVED Worker %d] Circuit breaker recovered, retrying classification for '%s'", workerID, task.normalizedName)
+							// Повторяем попытку классификации
+							result, err = hierarchicalClassifier.Classify(task.normalizedName, task.category)
+							if err == nil {
+								// Успешно после восстановления, продолжаем обработку
+								// Пропускаем обработку ошибки ниже
 							} else {
-								// Другая ошибка после retry
-								err = retryErr
+								// Все еще ошибка после восстановления
+								log.Printf("[KPVED Worker %d] Classification still failed after circuit breaker recovery: %v", workerID, err)
 							}
+						} else {
+							log.Printf("[KPVED Worker %d] Circuit breaker recovery timeout, skipping task '%s'", workerID, task.normalizedName)
+							// Таймаут восстановления, обрабатываем как ошибку
 						}
 					}
 
@@ -7847,21 +9705,23 @@ func (s *Server) handleKpvedReclassifyHierarchical(w http.ResponseWriter, r *htt
 					if err != nil {
 						// Обновляем errStr после возможных retry
 						errStr = err.Error()
+					}
+					
+					// Проверяем тип ошибки (объявляем переменную вне блока if для использования ниже)
+					var isRateLimit bool
+					if err != nil {
 						isRateLimit = strings.Contains(errStr, "rate limit") ||
 							strings.Contains(errStr, "too many requests") ||
 							strings.Contains(errStr, "429") ||
 							strings.Contains(errStr, "quota exceeded") ||
 							strings.Contains(errStr, "exceeded the maximum number of parallel requests")
 
-						// Если это rate limit или превышение параллельных запросов, делаем паузу
+						// Rate limiter в AIClient уже контролирует частоту запросов
+						// Если получили rate limit ошибку, просто возвращаем ошибку
+						// Rate limiter сам будет ждать перед следующим запросом
 						if isRateLimit {
-							log.Printf("[KPVED Worker %d] Rate limit detected, pausing for 3 seconds before retry...", workerID)
-							time.Sleep(3 * time.Second)
+							log.Printf("[KPVED Worker %d] Rate limit detected, rate limiter will handle throttling automatically", workerID)
 						}
-
-						// Добавляем небольшую задержку между запросами для предотвращения перегрузки API
-						// Это особенно важно при использовании 1 воркера
-						time.Sleep(100 * time.Millisecond)
 
 						// Удаляем задачу из отслеживания при ошибке
 						s.kpvedCurrentTasksMutex.Lock()
@@ -7933,23 +9793,16 @@ func (s *Server) handleKpvedReclassifyHierarchical(w http.ResponseWriter, r *htt
 					rowsAffected: rowsAffected,
 				}
 
-				// Добавляем задержку после успешной классификации для предотвращения перегрузки API
-				// Это особенно важно при использовании 1 воркера, чтобы не превысить rate limits
-				time.Sleep(200 * time.Millisecond)
+				// Rate limiter в AIClient уже контролирует частоту запросов, дополнительная задержка не нужна
 			}
 		}(i)
 	}
 
 	// Отправляем задачи в канал в отдельной горутине
-	// Ограничиваем скорость загрузки задач, чтобы не перегрузить канал и не вызвать circuit breaker
+	// Канал уже буферизован (maxWorkers*2), дополнительная задержка не нужна
 	go func() {
-		for i, task := range tasks {
+		for _, task := range tasks {
 			taskChan <- task
-			// Добавляем небольшую задержку каждые 10 задач, чтобы не перегружать канал
-			// Это предотвращает одновременную отправку большого количества запросов
-			if i > 0 && i%10 == 0 {
-				time.Sleep(100 * time.Millisecond)
-			}
 		}
 		close(taskChan)
 	}()
@@ -9430,4 +11283,1478 @@ func (s *Server) getModelFromConfig() string {
 	}
 
 	return model
+}
+
+// handlePendingDatabases обрабатывает запросы к /api/databases/pending
+func (s *Server) handlePendingDatabases(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.serviceDB == nil {
+		s.writeJSONError(w, "Service database not available", http.StatusInternalServerError)
+		return
+	}
+
+	statusFilter := r.URL.Query().Get("status")
+	databases, err := s.serviceDB.GetPendingDatabases(statusFilter)
+	if err != nil {
+		s.writeJSONError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	s.writeJSONResponse(w, map[string]interface{}{
+		"databases": databases,
+		"total":     len(databases),
+	}, http.StatusOK)
+}
+
+// handlePendingDatabaseRoutes обрабатывает запросы к /api/databases/pending/{id}
+func (s *Server) handlePendingDatabaseRoutes(w http.ResponseWriter, r *http.Request) {
+	if s.serviceDB == nil {
+		s.writeJSONError(w, "Service database not available", http.StatusInternalServerError)
+		return
+	}
+
+	path := strings.TrimPrefix(r.URL.Path, "/api/databases/pending/")
+	parts := strings.Split(path, "/")
+	if len(parts) < 1 || parts[0] == "" {
+		s.writeJSONError(w, "Invalid request path", http.StatusBadRequest)
+		return
+	}
+
+	id, err := strconv.Atoi(parts[0])
+	if err != nil {
+		s.writeJSONError(w, "Invalid database ID", http.StatusBadRequest)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		pendingDB, err := s.serviceDB.GetPendingDatabase(id)
+		if err != nil {
+			s.writeJSONError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if pendingDB == nil {
+			s.writeJSONError(w, "Pending database not found", http.StatusNotFound)
+			return
+		}
+		s.writeJSONResponse(w, pendingDB, http.StatusOK)
+
+	case http.MethodDelete:
+		if err := s.serviceDB.DeletePendingDatabase(id); err != nil {
+			s.writeJSONError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.writeJSONResponse(w, map[string]interface{}{"success": true}, http.StatusOK)
+
+	case http.MethodPost:
+		// Обработка действий: index, bind
+		if len(parts) < 2 {
+			s.writeJSONError(w, "Action required", http.StatusBadRequest)
+			return
+		}
+
+		action := parts[1]
+		switch action {
+		case "index":
+			s.handleStartIndexing(w, r, id)
+		case "bind":
+			s.handleBindPendingDatabase(w, r, id)
+		default:
+			s.writeJSONError(w, "Unknown action", http.StatusBadRequest)
+		}
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleStartIndexing запускает индексацию pending database
+func (s *Server) handleStartIndexing(w http.ResponseWriter, r *http.Request, id int) {
+	pendingDB, err := s.serviceDB.GetPendingDatabase(id)
+	if err != nil || pendingDB == nil {
+		s.writeJSONError(w, "Pending database not found", http.StatusNotFound)
+		return
+	}
+
+	if pendingDB.IndexingStatus == "indexing" {
+		s.writeJSONError(w, "Indexing already in progress", http.StatusBadRequest)
+		return
+	}
+
+	// Обновляем статус на indexing
+	if err := s.serviceDB.UpdatePendingDatabaseStatus(id, "indexing", ""); err != nil {
+		s.writeJSONError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Запускаем индексацию в горутине
+	go func() {
+		// Здесь можно добавить логику индексации БД
+		// Пока просто помечаем как completed
+		time.Sleep(1 * time.Second) // Симуляция индексации
+		s.serviceDB.UpdatePendingDatabaseStatus(id, "completed", "")
+	}()
+
+	s.writeJSONResponse(w, map[string]interface{}{
+		"success": true,
+		"message": "Indexing started",
+	}, http.StatusOK)
+}
+
+// handleBindPendingDatabase привязывает pending database к проекту
+func (s *Server) handleBindPendingDatabase(w http.ResponseWriter, r *http.Request, id int) {
+	var req struct {
+		ClientID   int    `json:"client_id"`
+		ProjectID  int    `json:"project_id"`
+		CustomPath string `json:"custom_path"` // Опциональный путь, если не указан - перемещаем в uploads
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeJSONError(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.ClientID == 0 || req.ProjectID == 0 {
+		s.writeJSONError(w, "client_id and project_id are required", http.StatusBadRequest)
+		return
+	}
+
+	pendingDB, err := s.serviceDB.GetPendingDatabase(id)
+	if err != nil || pendingDB == nil {
+		s.writeJSONError(w, "Pending database not found", http.StatusNotFound)
+		return
+	}
+
+	// Проверяем проект
+	project, err := s.serviceDB.GetClientProject(req.ProjectID)
+	if err != nil {
+		s.writeJSONError(w, "Project not found", http.StatusNotFound)
+		return
+	}
+
+	if project.ClientID != req.ClientID {
+		s.writeJSONError(w, "Project does not belong to this client", http.StatusBadRequest)
+		return
+	}
+
+	// Определяем новый путь к файлу
+	var newFilePath string
+	var movedToUploads bool
+
+	if req.CustomPath != "" {
+		// Используем указанный путь
+		newFilePath = req.CustomPath
+		movedToUploads = false
+	} else {
+		// Перемещаем в data/uploads/
+		uploadsDir, err := EnsureUploadsDirectory(".")
+		if err != nil {
+			s.writeJSONError(w, fmt.Sprintf("Failed to create uploads directory: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		newFilePath, err = MoveDatabaseToUploads(pendingDB.FilePath, uploadsDir)
+		if err != nil {
+			s.writeJSONError(w, fmt.Sprintf("Failed to move file: %v", err), http.StatusInternalServerError)
+			return
+		}
+		movedToUploads = true
+	}
+
+	// Обновляем pending database
+	if err := s.serviceDB.BindPendingDatabaseToProject(id, req.ClientID, req.ProjectID, newFilePath, movedToUploads); err != nil {
+		s.writeJSONError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Создаем запись в project_databases
+	fileInfo, _ := os.Stat(newFilePath)
+	fileSize := int64(0)
+	if fileInfo != nil {
+		fileSize = fileInfo.Size()
+	}
+
+	projectDB, err := s.serviceDB.CreateProjectDatabase(req.ProjectID, pendingDB.FileName, newFilePath, "Автоматически добавлена из pending databases", fileSize)
+	if err != nil {
+		s.writeJSONError(w, fmt.Sprintf("Failed to create project database: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Удаляем из pending databases
+	s.serviceDB.DeletePendingDatabase(id)
+
+	s.writeJSONResponse(w, map[string]interface{}{
+		"success":          true,
+		"message":          "Database bound to project",
+		"database":         projectDB,
+		"moved_to_uploads": movedToUploads,
+	}, http.StatusOK)
+}
+
+// handleScanDatabases запускает сканирование файлов
+func (s *Server) handleScanDatabases(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Paths []string `json:"paths"` // Опционально: пути для сканирования
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		// Если тело пустое, используем дефолтные пути
+		req.Paths = []string{".", "data/uploads"}
+	}
+
+	if len(req.Paths) == 0 {
+		req.Paths = []string{".", "data/uploads"}
+	}
+
+	foundFiles, err := ScanForDatabaseFiles(req.Paths, s.serviceDB)
+	if err != nil {
+		s.writeJSONError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	s.writeJSONResponse(w, map[string]interface{}{
+		"success":     true,
+		"found_files": len(foundFiles),
+		"files":       foundFiles,
+	}, http.StatusOK)
+}
+
+// handleCounterpartyDuplicates обрабатывает запросы на получение дублей контрагентов
+func (s *Server) handleCounterpartyDuplicates(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.writeJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Получаем параметры запроса
+	projectIDStr := r.URL.Query().Get("project_id")
+	if projectIDStr == "" {
+		s.writeJSONError(w, "project_id is required", http.StatusBadRequest)
+		return
+	}
+
+	projectID, err := strconv.Atoi(projectIDStr)
+	if err != nil {
+		s.writeJSONError(w, "Invalid project_id", http.StatusBadRequest)
+		return
+	}
+
+	// Проверяем существование проекта
+	_, err = s.serviceDB.GetClientProject(projectID)
+	if err != nil {
+		s.writeJSONError(w, "Project not found", http.StatusNotFound)
+		return
+	}
+
+	// Получаем базы данных проекта (только активные)
+	databases, err := s.serviceDB.GetProjectDatabases(projectID, true)
+	if err != nil {
+		s.writeJSONError(w, fmt.Sprintf("Failed to get project databases: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	if len(databases) == 0 {
+		s.writeJSONResponse(w, map[string]interface{}{
+			"groups":           []interface{}{},
+			"total_groups":     0,
+			"total_duplicates": 0,
+		}, http.StatusOK)
+		return
+	}
+
+	// Собираем все контрагенты из всех баз данных проекта
+	var allCounterparties []*database.CatalogItem
+	for _, dbInfo := range databases {
+		if !dbInfo.IsActive {
+			continue
+		}
+
+		// Открываем базу данных
+		db, err := database.NewDB(dbInfo.FilePath)
+		if err != nil {
+			log.Printf("Failed to open database %s: %v", dbInfo.FilePath, err)
+			continue
+		}
+		defer db.Close()
+
+		// Получаем все выгрузки из этой базы
+		uploads, err := db.GetAllUploads()
+		if err != nil {
+			log.Printf("Failed to get uploads from database %s: %v", dbInfo.FilePath, err)
+			continue
+		}
+
+		// Для каждой выгрузки получаем контрагентов
+		for _, upload := range uploads {
+			items, _, err := db.GetCatalogItemsByUpload(upload.ID, []string{"Контрагенты"}, 0, 0)
+			if err != nil {
+				log.Printf("Failed to get counterparties from upload %d: %v", upload.ID, err)
+				continue
+			}
+			allCounterparties = append(allCounterparties, items...)
+		}
+	}
+
+	if len(allCounterparties) == 0 {
+		s.writeJSONResponse(w, map[string]interface{}{
+			"groups":           []interface{}{},
+			"total_groups":     0,
+			"total_duplicates": 0,
+		}, http.StatusOK)
+		return
+	}
+
+	// Анализируем дубликаты
+	duplicateAnalyzer := normalization.NewCounterpartyDuplicateAnalyzer()
+	groups := duplicateAnalyzer.AnalyzeDuplicates(allCounterparties)
+
+	// Преобразуем группы в JSON-совместимый формат
+	responseGroups := make([]map[string]interface{}, len(groups))
+	for i, group := range groups {
+		items := make([]map[string]interface{}, len(group.Items))
+		for j, item := range group.Items {
+			items[j] = map[string]interface{}{
+				"id":            item.ID,
+				"reference":     item.Reference,
+				"code":          item.Code,
+				"name":          item.Name,
+				"inn":           item.INN,
+				"kpp":           item.KPP,
+				"bin":           item.BIN,
+				"legal_address": item.LegalAddress,
+				"quality_score": item.QualityScore,
+			}
+		}
+
+		masterItem := map[string]interface{}{}
+		if group.MasterItem != nil {
+			masterItem = map[string]interface{}{
+				"id":        group.MasterItem.ID,
+				"reference": group.MasterItem.Reference,
+				"code":      group.MasterItem.Code,
+				"name":      group.MasterItem.Name,
+				"inn":       group.MasterItem.INN,
+				"kpp":       group.MasterItem.KPP,
+				"bin":       group.MasterItem.BIN,
+			}
+		}
+
+		responseGroups[i] = map[string]interface{}{
+			"key":        group.Key,
+			"key_type":   group.KeyType,
+			"items":      items,
+			"master":     masterItem,
+			"confidence": group.Confidence,
+			"count":      len(group.Items),
+		}
+	}
+
+	summary := duplicateAnalyzer.GetDuplicateSummary(groups)
+
+	s.writeJSONResponse(w, map[string]interface{}{
+		"groups":                responseGroups,
+		"total_groups":          summary["total_groups"],
+		"total_duplicates":      summary["total_duplicates"],
+		"duplicates_by_inn_kpp": summary["duplicates_by_inn_kpp"],
+		"duplicates_by_bin":     summary["duplicates_by_bin"],
+		"duplicates_by_both":    summary["duplicates_by_both"],
+	}, http.StatusOK)
+}
+
+// handleCounterpartyDuplicateRoutes обрабатывает вложенные маршруты для дублей контрагентов
+func (s *Server) handleCounterpartyDuplicateRoutes(w http.ResponseWriter, r *http.Request) {
+	// Пока только основной эндпоинт, можно расширить в будущем
+	s.writeJSONError(w, "Not implemented", http.StatusNotImplemented)
+}
+
+// handleNormalizedCounterparties обрабатывает запросы на получение нормализованных контрагентов
+func (s *Server) handleNormalizedCounterparties(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.writeJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Поддерживаем два режима: по проекту или по клиенту
+	projectIDStr := r.URL.Query().Get("project_id")
+	clientIDStr := r.URL.Query().Get("client_id")
+
+	var counterparties []*database.NormalizedCounterparty
+	var projects []*database.ClientProject
+	var totalCount int
+
+	// Получаем параметры пагинации
+	offset := 0
+	limit := 100
+	if offsetStr := r.URL.Query().Get("offset"); offsetStr != "" {
+		if o, err := strconv.Atoi(offsetStr); err == nil {
+			offset = o
+		}
+	}
+	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 && l <= 1000 {
+			limit = l
+		}
+	}
+
+	// Получаем параметры фильтрации
+	search := r.URL.Query().Get("search")
+	enrichment := r.URL.Query().Get("enrichment")
+	subcategory := r.URL.Query().Get("subcategory")
+
+	if clientIDStr != "" {
+		// Режим получения по клиенту (все проекты)
+		clientID, err := strconv.Atoi(clientIDStr)
+		if err != nil {
+			s.writeJSONError(w, "Invalid client_id", http.StatusBadRequest)
+			return
+		}
+
+		var projectID *int
+		if projectIDStr != "" {
+			pID, err := strconv.Atoi(projectIDStr)
+			if err == nil {
+				projectID = &pID
+			}
+		}
+
+		counterparties, projects, totalCount, err = s.serviceDB.GetNormalizedCounterpartiesByClient(clientID, projectID, offset, limit, search, enrichment, subcategory)
+		if err != nil {
+			s.writeJSONError(w, fmt.Sprintf("Failed to get counterparties: %v", err), http.StatusInternalServerError)
+			return
+		}
+	} else if projectIDStr != "" {
+		// Режим получения по проекту
+		projectID, err := strconv.Atoi(projectIDStr)
+		if err != nil {
+			s.writeJSONError(w, "Invalid project_id", http.StatusBadRequest)
+			return
+		}
+
+		// Проверяем существование проекта
+		project, err := s.serviceDB.GetClientProject(projectID)
+		if err != nil {
+			s.writeJSONError(w, "Project not found", http.StatusNotFound)
+			return
+		}
+
+		// Получаем нормализованных контрагентов
+		counterparties, totalCount, err = s.serviceDB.GetNormalizedCounterparties(projectID, offset, limit, search, enrichment, subcategory)
+		if err != nil {
+			s.writeJSONError(w, fmt.Sprintf("Failed to get normalized counterparties: %v", err), http.StatusInternalServerError)
+			return
+		}
+		projects = []*database.ClientProject{project}
+	} else {
+		s.writeJSONError(w, "Either project_id or client_id is required", http.StatusBadRequest)
+		return
+	}
+
+	// Формируем ответ с информацией о проектах
+	projectsInfo := make([]map[string]interface{}, len(projects))
+	for i, p := range projects {
+		projectsInfo[i] = map[string]interface{}{
+			"id":   p.ID,
+			"name": p.Name,
+		}
+	}
+
+	s.writeJSONResponse(w, map[string]interface{}{
+		"counterparties": counterparties,
+		"projects":       projectsInfo,
+		"total":          totalCount,
+		"offset":         offset,
+		"limit":          limit,
+	}, http.StatusOK)
+}
+
+// handleNormalizedCounterpartyRoutes обрабатывает вложенные маршруты для нормализованных контрагентов
+func (s *Server) handleNormalizedCounterpartyRoutes(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/api/counterparties/normalized/")
+	parts := strings.Split(path, "/")
+
+	if len(parts) == 0 || parts[0] == "" {
+		s.writeJSONError(w, "Invalid request path", http.StatusBadRequest)
+		return
+	}
+
+	// Обработка stats
+	if len(parts) == 1 && parts[0] == "stats" {
+		s.handleNormalizedCounterpartyStats(w, r)
+		return
+	}
+
+	// Обработка enrich - ручное обогащение
+	if len(parts) == 1 && parts[0] == "enrich" {
+		if r.Method == http.MethodPost {
+			s.handleEnrichCounterparty(w, r)
+		} else {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+		return
+	}
+
+	// Обработка duplicates - получение групп дубликатов
+	if len(parts) == 1 && parts[0] == "duplicates" {
+		if r.Method == http.MethodGet {
+			s.handleGetCounterpartyDuplicates(w, r)
+		} else {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+		return
+	}
+
+	// Обработка merge дубликатов: /api/counterparties/normalized/duplicates/{groupId}/merge
+	if len(parts) == 3 && parts[0] == "duplicates" && parts[2] == "merge" {
+		if r.Method == http.MethodPost {
+			groupId, err := strconv.Atoi(parts[1])
+			if err != nil {
+				s.writeJSONError(w, "Invalid duplicate group ID", http.StatusBadRequest)
+				return
+			}
+			s.handleMergeCounterpartyDuplicates(w, r, groupId)
+		} else {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+		return
+	}
+
+	// Обработка export - экспорт контрагентов
+	if len(parts) == 1 && parts[0] == "export" {
+		if r.Method == http.MethodPost {
+			s.handleExportCounterparties(w, r)
+		} else {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+		return
+	}
+
+	// Обработка конкретного контрагента по ID: /api/counterparties/normalized/{id}
+	if len(parts) == 1 {
+		id, err := strconv.Atoi(parts[0])
+		if err != nil {
+			s.writeJSONError(w, "Invalid counterparty ID", http.StatusBadRequest)
+			return
+		}
+
+		switch r.Method {
+		case http.MethodGet:
+			s.handleGetNormalizedCounterparty(w, r, id)
+		case http.MethodPut, http.MethodPatch:
+			s.handleUpdateNormalizedCounterparty(w, r, id)
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+		return
+	}
+
+	s.writeJSONError(w, "Not found", http.StatusNotFound)
+}
+
+// handleNormalizedCounterpartyStats получает статистику по нормализованным контрагентам
+func (s *Server) handleNormalizedCounterpartyStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.writeJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	projectIDStr := r.URL.Query().Get("project_id")
+	if projectIDStr == "" {
+		s.writeJSONError(w, "project_id is required", http.StatusBadRequest)
+		return
+	}
+
+	projectID, err := strconv.Atoi(projectIDStr)
+	if err != nil {
+		s.writeJSONError(w, "Invalid project_id", http.StatusBadRequest)
+		return
+	}
+
+	// Проверяем существование проекта
+	_, err = s.serviceDB.GetClientProject(projectID)
+	if err != nil {
+		s.writeJSONError(w, "Project not found", http.StatusNotFound)
+		return
+	}
+
+	// Получаем статистику
+	stats, err := s.serviceDB.GetNormalizedCounterpartyStats(projectID)
+	if err != nil {
+		s.writeJSONError(w, fmt.Sprintf("Failed to get stats: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	s.writeJSONResponse(w, stats, http.StatusOK)
+}
+
+// handleGetNormalizedCounterparty получает контрагента по ID
+func (s *Server) handleGetNormalizedCounterparty(w http.ResponseWriter, r *http.Request, id int) {
+	counterparty, err := s.serviceDB.GetNormalizedCounterparty(id)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			s.writeJSONError(w, "Counterparty not found", http.StatusNotFound)
+		} else {
+			s.writeJSONError(w, fmt.Sprintf("Failed to get counterparty: %v", err), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	s.writeJSONResponse(w, counterparty, http.StatusOK)
+}
+
+// handleUpdateNormalizedCounterparty обновляет контрагента
+func (s *Server) handleUpdateNormalizedCounterparty(w http.ResponseWriter, r *http.Request, id int) {
+	var req struct {
+		NormalizedName       string  `json:"normalized_name"`
+		TaxID                string  `json:"tax_id"`
+		KPP                  string  `json:"kpp"`
+		BIN                  string  `json:"bin"`
+		LegalAddress         string  `json:"legal_address"`
+		PostalAddress        string  `json:"postal_address"`
+		ContactPhone         string  `json:"contact_phone"`
+		ContactEmail         string  `json:"contact_email"`
+		ContactPerson        string  `json:"contact_person"`
+		LegalForm            string  `json:"legal_form"`
+		BankName             string  `json:"bank_name"`
+		BankAccount          string  `json:"bank_account"`
+		CorrespondentAccount string  `json:"correspondent_account"`
+		BIK                  string  `json:"bik"`
+		QualityScore         float64 `json:"quality_score"`
+		SourceEnrichment     string  `json:"source_enrichment"`
+		Subcategory          string  `json:"subcategory"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeJSONError(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Проверяем существование контрагента
+	_, err := s.serviceDB.GetNormalizedCounterparty(id)
+	if err != nil {
+		s.writeJSONError(w, "Counterparty not found", http.StatusNotFound)
+		return
+	}
+
+	// Обновляем контрагента
+	err = s.serviceDB.UpdateNormalizedCounterparty(
+		id,
+		req.NormalizedName,
+		req.TaxID, req.KPP, req.BIN,
+		req.LegalAddress, req.PostalAddress,
+		req.ContactPhone, req.ContactEmail,
+		req.ContactPerson, req.LegalForm,
+		req.BankName, req.BankAccount,
+		req.CorrespondentAccount, req.BIK,
+		req.QualityScore,
+		req.SourceEnrichment,
+		req.Subcategory,
+	)
+	if err != nil {
+		s.writeJSONError(w, fmt.Sprintf("Failed to update counterparty: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Получаем обновленного контрагента
+	updated, err := s.serviceDB.GetNormalizedCounterparty(id)
+	if err != nil {
+		s.writeJSONError(w, fmt.Sprintf("Failed to get updated counterparty: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	s.writeJSONResponse(w, map[string]interface{}{
+		"success":      true,
+		"message":      "Counterparty updated successfully",
+		"counterparty": updated,
+	}, http.StatusOK)
+}
+
+// handleEnrichCounterparty выполняет ручное обогащение контрагента
+func (s *Server) handleEnrichCounterparty(w http.ResponseWriter, r *http.Request) {
+	if s.enrichmentFactory == nil {
+		s.writeJSONError(w, "Enrichment is not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req struct {
+		CounterpartyID int    `json:"counterparty_id"`
+		INN            string `json:"inn"`
+		BIN            string `json:"bin"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeJSONError(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Если указан ID контрагента, получаем его данные
+	if req.CounterpartyID > 0 {
+		cp, err := s.serviceDB.GetNormalizedCounterparty(req.CounterpartyID)
+		if err != nil {
+			s.writeJSONError(w, "Counterparty not found", http.StatusNotFound)
+			return
+		}
+		if req.INN == "" {
+			req.INN = cp.TaxID
+		}
+		if req.BIN == "" {
+			req.BIN = cp.BIN
+		}
+	}
+
+	if req.INN == "" && req.BIN == "" {
+		s.writeJSONError(w, "INN or BIN is required", http.StatusBadRequest)
+		return
+	}
+
+	// Выполняем обогащение
+	response := s.enrichmentFactory.Enrich(req.INN, req.BIN)
+	if !response.Success {
+		s.writeJSONResponse(w, map[string]interface{}{
+			"success": false,
+			"errors":  response.Errors,
+		}, http.StatusOK)
+		return
+	}
+
+	// Берем лучший результат
+	bestResult := s.enrichmentFactory.GetBestResult(response.Results)
+	if bestResult == nil {
+		s.writeJSONResponse(w, map[string]interface{}{
+			"success": false,
+			"message": "No enrichment results available",
+		}, http.StatusOK)
+		return
+	}
+
+	// Если указан ID контрагента, обновляем его
+	if req.CounterpartyID > 0 {
+		cp, _ := s.serviceDB.GetNormalizedCounterparty(req.CounterpartyID)
+		if cp != nil {
+			// Объединяем данные из обогащения
+			normalizedName := cp.NormalizedName
+			if bestResult.FullName != "" {
+				normalizedName = bestResult.FullName
+			}
+
+			inn := cp.TaxID
+			if bestResult.INN != "" {
+				inn = bestResult.INN
+			}
+			bin := cp.BIN
+			if bestResult.BIN != "" {
+				bin = bestResult.BIN
+			}
+
+			legalAddress := cp.LegalAddress
+			if bestResult.LegalAddress != "" {
+				legalAddress = bestResult.LegalAddress
+			}
+
+			contactPhone := cp.ContactPhone
+			if bestResult.Phone != "" {
+				contactPhone = bestResult.Phone
+			}
+
+			contactEmail := cp.ContactEmail
+			if bestResult.Email != "" {
+				contactEmail = bestResult.Email
+			}
+
+			// Обновляем контрагента
+			err := s.serviceDB.UpdateNormalizedCounterparty(
+				req.CounterpartyID,
+				normalizedName,
+				inn, cp.KPP, bin,
+				legalAddress, cp.PostalAddress,
+				contactPhone, contactEmail,
+				cp.ContactPerson, cp.LegalForm,
+				cp.BankName, cp.BankAccount,
+				cp.CorrespondentAccount, cp.BIK,
+				cp.QualityScore,
+				bestResult.Source,
+				cp.Subcategory,
+			)
+			if err != nil {
+				log.Printf("Failed to update counterparty after enrichment: %v", err)
+			}
+		}
+	}
+
+	// Преобразуем результат в JSON для ответа
+	resultJSON, _ := bestResult.ToJSON()
+
+	s.writeJSONResponse(w, map[string]interface{}{
+		"success": true,
+		"result":  bestResult,
+		"raw":     resultJSON,
+	}, http.StatusOK)
+}
+
+// handleGetCounterpartyDuplicates получает группы дубликатов контрагентов
+func (s *Server) handleGetCounterpartyDuplicates(w http.ResponseWriter, r *http.Request) {
+	projectIDStr := r.URL.Query().Get("project_id")
+	if projectIDStr == "" {
+		s.writeJSONError(w, "project_id is required", http.StatusBadRequest)
+		return
+	}
+
+	projectID, err := strconv.Atoi(projectIDStr)
+	if err != nil {
+		s.writeJSONError(w, "Invalid project_id", http.StatusBadRequest)
+		return
+	}
+
+	// Получаем всех контрагентов проекта
+	counterparties, _, err := s.serviceDB.GetNormalizedCounterparties(projectID, 0, 10000, "", "", "")
+	if err != nil {
+		s.writeJSONError(w, fmt.Sprintf("Failed to get counterparties: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Группируем по ИНН/БИН
+	groups := make(map[string][]*database.NormalizedCounterparty)
+	for _, cp := range counterparties {
+		key := cp.TaxID
+		if key == "" {
+			key = cp.BIN
+		}
+		if key != "" {
+			groups[key] = append(groups[key], cp)
+		}
+	}
+
+	// Фильтруем только группы с дубликатами
+	duplicateGroups := []map[string]interface{}{}
+	for key, items := range groups {
+		if len(items) > 1 {
+			duplicateGroups = append(duplicateGroups, map[string]interface{}{
+				"tax_id": key,
+				"count":  len(items),
+				"items":  items,
+			})
+		}
+	}
+
+	s.writeJSONResponse(w, map[string]interface{}{
+		"total_groups": len(duplicateGroups),
+		"groups":       duplicateGroups,
+	}, http.StatusOK)
+}
+
+// handleMergeCounterpartyDuplicates выполняет слияние дубликатов
+func (s *Server) handleMergeCounterpartyDuplicates(w http.ResponseWriter, r *http.Request, groupID int) {
+	var req struct {
+		MasterID int   `json:"master_id"`
+		MergeIDs []int `json:"merge_ids"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeJSONError(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.MasterID == 0 {
+		s.writeJSONError(w, "master_id is required", http.StatusBadRequest)
+		return
+	}
+
+	// Получаем мастер-контрагента
+	master, err := s.serviceDB.GetNormalizedCounterparty(req.MasterID)
+	if err != nil {
+		s.writeJSONError(w, "Master counterparty not found", http.StatusNotFound)
+		return
+	}
+
+	// Объединяем данные из дубликатов в мастер
+	for _, mergeID := range req.MergeIDs {
+		if mergeID == req.MasterID {
+			continue
+		}
+
+		duplicate, err := s.serviceDB.GetNormalizedCounterparty(mergeID)
+		if err != nil {
+			continue
+		}
+
+		// Объединяем данные (приоритет у мастер-записи)
+		if master.LegalAddress == "" && duplicate.LegalAddress != "" {
+			master.LegalAddress = duplicate.LegalAddress
+		}
+		if master.PostalAddress == "" && duplicate.PostalAddress != "" {
+			master.PostalAddress = duplicate.PostalAddress
+		}
+		if master.ContactPhone == "" && duplicate.ContactPhone != "" {
+			master.ContactPhone = duplicate.ContactPhone
+		}
+		if master.ContactEmail == "" && duplicate.ContactEmail != "" {
+			master.ContactEmail = duplicate.ContactEmail
+		}
+		if master.ContactPerson == "" && duplicate.ContactPerson != "" {
+			master.ContactPerson = duplicate.ContactPerson
+		}
+
+		// Обновляем мастер-запись
+		err = s.serviceDB.UpdateNormalizedCounterparty(
+			req.MasterID,
+			master.NormalizedName,
+			master.TaxID, master.KPP, master.BIN,
+			master.LegalAddress, master.PostalAddress,
+			master.ContactPhone, master.ContactEmail,
+			master.ContactPerson, master.LegalForm,
+			master.BankName, master.BankAccount,
+			master.CorrespondentAccount, master.BIK,
+			master.QualityScore,
+			master.SourceEnrichment,
+			master.Subcategory,
+		)
+		if err != nil {
+			log.Printf("Failed to update master counterparty: %v", err)
+		}
+
+		// Помечаем дубликат как объединенный - удаляем запись
+		// Все данные уже перенесены в мастер-запись
+		err = s.serviceDB.DeleteNormalizedCounterparty(mergeID)
+		if err != nil {
+			log.Printf("Warning: Failed to delete merged counterparty %d: %v", mergeID, err)
+			// Не критично - продолжаем работу
+		} else {
+			log.Printf("Merged and deleted counterparty %d into master %d", mergeID, req.MasterID)
+		}
+	}
+
+	s.writeJSONResponse(w, map[string]interface{}{
+		"success": true,
+		"message": fmt.Sprintf("Merged %d counterparties into master %d", len(req.MergeIDs), req.MasterID),
+	}, http.StatusOK)
+}
+
+// handleExportCounterparties экспортирует контрагентов
+func (s *Server) handleExportCounterparties(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ProjectID int    `json:"project_id"`
+		Format    string `json:"format"` // csv, json, xml
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeJSONError(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.ProjectID == 0 {
+		s.writeJSONError(w, "project_id is required", http.StatusBadRequest)
+		return
+	}
+
+	if req.Format == "" {
+		req.Format = "json"
+	}
+
+	// Получаем всех контрагентов проекта
+	counterparties, _, err := s.serviceDB.GetNormalizedCounterparties(req.ProjectID, 0, 100000, "", "", "")
+	if err != nil {
+		s.writeJSONError(w, fmt.Sprintf("Failed to get counterparties: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	switch req.Format {
+	case "csv":
+		w.Header().Set("Content-Type", "text/csv")
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=counterparties_%d.csv", req.ProjectID))
+		csvWriter := csv.NewWriter(w)
+		defer csvWriter.Flush()
+
+		// Заголовки
+		csvWriter.Write([]string{
+			"ID", "Name", "Normalized Name", "INN", "KPP", "BIN",
+			"Legal Address", "Postal Address", "Phone", "Email",
+			"Contact Person", "Quality Score", "Source Enrichment",
+		})
+
+		// Данные
+		for _, cp := range counterparties {
+			csvWriter.Write([]string{
+				fmt.Sprintf("%d", cp.ID),
+				cp.SourceName,
+				cp.NormalizedName,
+				cp.TaxID,
+				cp.KPP,
+				cp.BIN,
+				cp.LegalAddress,
+				cp.PostalAddress,
+				cp.ContactPhone,
+				cp.ContactEmail,
+				cp.ContactPerson,
+				fmt.Sprintf("%.2f", cp.QualityScore),
+				cp.SourceEnrichment,
+			})
+		}
+
+	case "xml":
+		w.Header().Set("Content-Type", "application/xml")
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=counterparties_%d.xml", req.ProjectID))
+		w.Write([]byte("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<counterparties>\n"))
+		for _, cp := range counterparties {
+			w.Write([]byte(fmt.Sprintf(
+				"  <counterparty id=\"%d\">\n    <name>%s</name>\n    <normalized_name>%s</normalized_name>\n    <inn>%s</inn>\n    <kpp>%s</kpp>\n    <bin>%s</bin>\n  </counterparty>\n",
+				cp.ID, cp.SourceName, cp.NormalizedName, cp.TaxID, cp.KPP, cp.BIN,
+			)))
+		}
+		w.Write([]byte("</counterparties>\n"))
+
+	default: // json
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=counterparties_%d.json", req.ProjectID))
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"project_id":     req.ProjectID,
+			"total":          len(counterparties),
+			"counterparties": counterparties,
+		})
+	}
+}
+
+// handleFindProjectByDatabase находит клиента и проект по пути базы данных
+func (s *Server) handleFindProjectByDatabase(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.writeJSONError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	filePath := r.URL.Query().Get("file_path")
+	if filePath == "" {
+		s.writeJSONError(w, "file_path parameter is required", http.StatusBadRequest)
+		return
+	}
+
+	clientID, projectID, err := s.serviceDB.FindClientAndProjectByDatabasePath(filePath)
+	if err != nil {
+		s.writeJSONError(w, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	// Получаем db_id по пути базы данных
+	var dbID *int
+	databases, err := s.serviceDB.GetProjectDatabases(projectID, false)
+	if err == nil {
+		for _, db := range databases {
+			if db.FilePath == filePath {
+				dbID = &db.ID
+				break
+			}
+		}
+	}
+
+	response := map[string]interface{}{
+		"client_id":  clientID,
+		"project_id": projectID,
+	}
+	if dbID != nil {
+		response["db_id"] = *dbID
+	}
+
+	s.writeJSONResponse(w, response, http.StatusOK)
+}
+
+// handleGetProjectPipelineStats получает статистику этапов обработки для проекта
+func (s *Server) handleGetProjectPipelineStats(w http.ResponseWriter, r *http.Request, clientID, projectID int) {
+	// Проверяем существование проекта
+	project, err := s.serviceDB.GetClientProject(projectID)
+	if err != nil {
+		s.writeJSONError(w, "Project not found", http.StatusNotFound)
+		return
+	}
+
+	if project.ClientID != clientID {
+		s.writeJSONError(w, "Project does not belong to this client", http.StatusBadRequest)
+		return
+	}
+
+	// Проверяем тип проекта - статистика этапов для номенклатуры и нормализации
+	// Также поддерживаем nomenclature_counterparties для совместимости
+	if project.ProjectType != "nomenclature" && 
+	   project.ProjectType != "normalization" && 
+	   project.ProjectType != "nomenclature_counterparties" {
+		s.writeJSONError(w, "Pipeline stats are only available for nomenclature and normalization projects", http.StatusBadRequest)
+		return
+	}
+
+	// Получаем активные базы данных проекта
+	databases, err := s.serviceDB.GetProjectDatabases(projectID, true)
+	if err != nil {
+		s.writeJSONError(w, fmt.Sprintf("Failed to get project databases: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	if len(databases) == 0 {
+		s.writeJSONResponse(w, map[string]interface{}{
+			"total_records":       0,
+			"overall_progress":    0,
+			"stage_stats":         []interface{}{},
+			"quality_metrics":     map[string]interface{}{},
+			"processing_duration": "N/A",
+			"last_updated":        "",
+			"message":             "No active databases found for this project",
+		}, http.StatusOK)
+		return
+	}
+
+	// Агрегируем статистику по всем активным БД проекта
+	var allStats []map[string]interface{}
+	for _, dbInfo := range databases {
+		stats, err := database.GetProjectPipelineStats(dbInfo.FilePath)
+		if err != nil {
+			log.Printf("Failed to get pipeline stats from database %s: %v", dbInfo.FilePath, err)
+			continue
+		}
+		allStats = append(allStats, stats)
+	}
+
+	// Агрегируем статистику из всех БД
+	if len(allStats) == 0 {
+		s.writeJSONResponse(w, map[string]interface{}{
+			"total_records":       0,
+			"overall_progress":    0,
+			"stage_stats":         []interface{}{},
+			"quality_metrics":     map[string]interface{}{},
+			"processing_duration": "N/A",
+			"last_updated":        "",
+			"message":             "No statistics available",
+		}, http.StatusOK)
+		return
+	}
+
+	// Объединяем статистику из всех БД
+	aggregatedStats := database.AggregatePipelineStats(allStats)
+	s.writeJSONResponse(w, aggregatedStats, http.StatusOK)
+}
+
+// extractKeywords извлекает ключевые слова из нормализованного имени
+func extractKeywords(normalizedName string) []string {
+	// Удаляем служебные слова и символы
+	stopWords := map[string]bool{
+		"и": true, "в": true, "на": true, "с": true, "по": true, "для": true,
+		"из": true, "от": true, "к": true, "о": true, "об": true, "со": true,
+		"the": true, "a": true, "an": true, "and": true, "or": true, "of": true,
+		"to": true, "in": true, "for": true, "with": true, "on": true,
+	}
+
+	// Разбиваем на слова
+	words := regexp.MustCompile(`\s+`).Split(strings.ToLower(normalizedName), -1)
+	var keywords []string
+
+	for _, word := range words {
+		// Удаляем знаки препинания
+		word = regexp.MustCompile(`[^\p{L}\p{N}]+`).ReplaceAllString(word, "")
+		// Пропускаем короткие слова и стоп-слова
+		if len(word) >= 3 && !stopWords[word] {
+			keywords = append(keywords, word)
+		}
+	}
+
+	return keywords
+}
+
+// calculateOkpd2Confidence вычисляет уверенность классификации ОКПД2
+func calculateOkpd2Confidence(searchTerm, okpd2Name string, level int) float64 {
+	searchTerm = strings.ToLower(searchTerm)
+	okpd2NameLower := strings.ToLower(okpd2Name)
+
+	// Базовая уверенность зависит от уровня (более глубокие уровни более специфичны)
+	baseConfidence := 0.3 + float64(level)*0.1
+	if baseConfidence > 0.9 {
+		baseConfidence = 0.9
+	}
+
+	// Точное совпадение
+	if okpd2NameLower == searchTerm {
+		return 0.95
+	}
+
+	// Начинается с поискового термина
+	if strings.HasPrefix(okpd2NameLower, searchTerm) {
+		return baseConfidence + 0.3
+	}
+
+	// Содержит поисковый термин
+	if strings.Contains(okpd2NameLower, searchTerm) {
+		// Проверяем, сколько раз встречается
+		count := strings.Count(okpd2NameLower, searchTerm)
+		confidence := baseConfidence + float64(count)*0.1
+		if confidence > 0.85 {
+			confidence = 0.85
+		}
+		return confidence
+	}
+
+	// Частичное совпадение (по словам)
+	okpd2Words := regexp.MustCompile(`\s+`).Split(okpd2NameLower, -1)
+	matchedWords := 0
+	for _, word := range okpd2Words {
+		if strings.Contains(word, searchTerm) || strings.Contains(searchTerm, word) {
+			matchedWords++
+		}
+	}
+
+	if matchedWords > 0 {
+		wordMatchConfidence := float64(matchedWords) / float64(len(okpd2Words)) * 0.4
+		return baseConfidence + wordMatchConfidence
+	}
+
+	return baseConfidence
+}
+
+// classifyKpvedForDatabase выполняет КПВЭД классификацию для базы данных
+func (s *Server) classifyKpvedForDatabase(db *database.DB, dbName string) {
+	log.Println("Начинаем КПВЭД классификацию...")
+	s.normalizerEvents <- "Начало КПВЭД классификации"
+
+	s.kpvedClassifierMutex.RLock()
+	classifier := s.hierarchicalClassifier
+	s.kpvedClassifierMutex.RUnlock()
+
+	if classifier == nil {
+		log.Println("КПВЭД классификатор недоступен")
+		s.normalizerEvents <- "КПВЭД классификатор недоступен"
+		return
+	}
+
+	// Получаем записи без КПВЭД классификации
+	rows, err := db.Query(`
+		SELECT id, normalized_name, category
+		FROM normalized_data
+		WHERE (kpved_code IS NULL OR kpved_code = '' OR TRIM(kpved_code) = '')
+	`)
+	if err != nil {
+		log.Printf("Ошибка получения записей для КПВЭД классификации: %v", err)
+		s.normalizerEvents <- fmt.Sprintf("Ошибка КПВЭД: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	var recordsToClassify []struct {
+		ID             int
+		NormalizedName string
+		Category       string
+	}
+
+	for rows.Next() {
+		var record struct {
+			ID             int
+			NormalizedName string
+			Category       string
+		}
+		if err := rows.Scan(&record.ID, &record.NormalizedName, &record.Category); err != nil {
+			log.Printf("Ошибка сканирования записи: %v", err)
+			continue
+		}
+		recordsToClassify = append(recordsToClassify, record)
+	}
+
+	totalToClassify := len(recordsToClassify)
+	if totalToClassify == 0 {
+		log.Println("Нет записей для КПВЭД классификации")
+		s.normalizerEvents <- "Все записи уже классифицированы по КПВЭД"
+		return
+	}
+
+	log.Printf("Найдено записей для КПВЭД классификации: %d", totalToClassify)
+	s.normalizerEvents <- fmt.Sprintf("Классификация %d записей по КПВЭД", totalToClassify)
+
+	classified := 0
+	failed := 0
+	for i, record := range recordsToClassify {
+		result, err := classifier.Classify(record.NormalizedName, record.Category)
+		if err != nil {
+			log.Printf("Ошибка классификации записи %d: %v", record.ID, err)
+			failed++
+			continue
+		}
+
+		_, err = db.Exec(`
+			UPDATE normalized_data
+			SET kpved_code = ?, kpved_name = ?, kpved_confidence = ?,
+			    stage11_kpved_code = ?, stage11_kpved_name = ?, stage11_kpved_confidence = ?,
+			    stage11_kpved_completed = 1, stage11_kpved_completed_at = CURRENT_TIMESTAMP
+			WHERE id = ?
+		`, result.FinalCode, result.FinalName, result.FinalConfidence,
+			result.FinalCode, result.FinalName, result.FinalConfidence, record.ID)
+
+		if err != nil {
+			log.Printf("Ошибка обновления КПВЭД для записи %d: %v", record.ID, err)
+			failed++
+			continue
+		}
+
+		classified++
+
+		if (i+1)%10 == 0 || i+1 == totalToClassify {
+			progress := float64(i+1) / float64(totalToClassify) * 100
+			log.Printf("КПВЭД классификация: %d/%d (%.1f%%)", i+1, totalToClassify, progress)
+			s.normalizerEvents <- fmt.Sprintf("КПВЭД: %d/%d (%.1f%%)", i+1, totalToClassify, progress)
+		}
+	}
+
+	log.Printf("КПВЭД классификация завершена: классифицировано %d из %d записей (ошибок: %d)", classified, totalToClassify, failed)
+	s.normalizerEvents <- fmt.Sprintf("КПВЭД классификация завершена: %d/%d (ошибок: %d)", classified, totalToClassify, failed)
+}
+
+// classifyOkpd2ForDatabase выполняет ОКПД2 классификацию для базы данных
+func (s *Server) classifyOkpd2ForDatabase(db *database.DB, dbName string) {
+	log.Println("Начинаем ОКПД2 классификацию...")
+	s.normalizerEvents <- "Начало ОКПД2 классификации"
+
+	serviceDB := s.serviceDB.GetDB()
+
+	// Получаем записи без ОКПД2 классификации
+	rows, err := db.Query(`
+		SELECT id, normalized_name, category
+		FROM normalized_data
+		WHERE (stage12_okpd2_code IS NULL OR stage12_okpd2_code = '' OR TRIM(stage12_okpd2_code) = '')
+	`)
+	if err != nil {
+		log.Printf("Ошибка получения записей для ОКПД2 классификации: %v", err)
+		s.normalizerEvents <- fmt.Sprintf("Ошибка ОКПД2: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	var recordsToClassify []struct {
+		ID             int
+		NormalizedName string
+		Category       string
+	}
+
+	for rows.Next() {
+		var record struct {
+			ID             int
+			NormalizedName string
+			Category       string
+		}
+		if err := rows.Scan(&record.ID, &record.NormalizedName, &record.Category); err != nil {
+			log.Printf("Ошибка сканирования записи: %v", err)
+			continue
+		}
+		recordsToClassify = append(recordsToClassify, record)
+	}
+
+	totalToClassify := len(recordsToClassify)
+	if totalToClassify == 0 {
+		log.Println("Нет записей для ОКПД2 классификации")
+		s.normalizerEvents <- "Все записи уже классифицированы по ОКПД2"
+		return
+	}
+
+	log.Printf("Найдено записей для ОКПД2 классификации: %d", totalToClassify)
+	s.normalizerEvents <- fmt.Sprintf("Классификация %d записей по ОКПД2", totalToClassify)
+
+	classified := 0
+	failed := 0
+
+	for i, record := range recordsToClassify {
+		// Простой поиск по ключевым словам в ОКПД2
+		searchTerms := extractKeywords(record.NormalizedName)
+		if len(searchTerms) == 0 {
+			searchTerms = []string{record.NormalizedName}
+		}
+
+		var bestMatch struct {
+			Code       string
+			Name       string
+			Confidence float64
+		}
+		bestMatch.Confidence = 0.0
+
+		// Ищем совпадения по каждому ключевому слову
+		for _, term := range searchTerms {
+			if len(term) < 3 {
+				continue
+			}
+
+			searchPattern := "%" + term + "%"
+			query := `
+				SELECT code, name, level
+				FROM okpd2_classifier
+				WHERE name LIKE ?
+				ORDER BY 
+					CASE 
+						WHEN name LIKE ? THEN 1
+						WHEN name LIKE ? THEN 2
+						ELSE 3
+					END,
+					level DESC
+				LIMIT 5
+			`
+			exactPattern := term
+			startPattern := term + "%"
+
+			okpd2Rows, err := serviceDB.Query(query, searchPattern, exactPattern, startPattern)
+			if err != nil {
+				log.Printf("Ошибка поиска ОКПД2 для '%s': %v", term, err)
+				continue
+			}
+
+			for okpd2Rows.Next() {
+				var code, name string
+				var level int
+				if err := okpd2Rows.Scan(&code, &name, &level); err != nil {
+					continue
+				}
+
+				confidence := calculateOkpd2Confidence(term, name, level)
+				if confidence > bestMatch.Confidence {
+					bestMatch.Code = code
+					bestMatch.Name = name
+					bestMatch.Confidence = confidence
+				}
+			}
+			okpd2Rows.Close()
+		}
+
+		// Если нашли совпадение с достаточной уверенностью, сохраняем
+		if bestMatch.Confidence >= 0.3 && bestMatch.Code != "" {
+			_, err = db.Exec(`
+				UPDATE normalized_data
+				SET stage12_okpd2_code = ?, stage12_okpd2_name = ?, stage12_okpd2_confidence = ?,
+				    stage12_okpd2_completed = 1, stage12_okpd2_completed_at = CURRENT_TIMESTAMP
+				WHERE id = ?
+			`, bestMatch.Code, bestMatch.Name, bestMatch.Confidence, record.ID)
+
+			if err != nil {
+				log.Printf("Ошибка обновления ОКПД2 для записи %d: %v", record.ID, err)
+				failed++
+				continue
+			}
+
+			classified++
+		} else {
+			// Отмечаем как обработанное, но без результата
+			_, err = db.Exec(`
+				UPDATE normalized_data
+				SET stage12_okpd2_completed = 1, stage12_okpd2_completed_at = CURRENT_TIMESTAMP
+				WHERE id = ?
+			`, record.ID)
+			if err != nil {
+				log.Printf("Ошибка обновления статуса ОКПД2 для записи %d: %v", record.ID, err)
+			}
+			failed++
+		}
+
+		// Логируем прогресс каждые 10 записей или на последней записи
+		if (i+1)%10 == 0 || i+1 == totalToClassify {
+			progress := float64(i+1) / float64(totalToClassify) * 100
+			log.Printf("ОКПД2 классификация: %d/%d (%.1f%%)", i+1, totalToClassify, progress)
+			s.normalizerEvents <- fmt.Sprintf("ОКПД2: %d/%d (%.1f%%)", i+1, totalToClassify, progress)
+		}
+	}
+
+	log.Printf("ОКПД2 классификация завершена: классифицировано %d из %d записей (не найдено: %d)", classified, totalToClassify, failed)
+	s.normalizerEvents <- fmt.Sprintf("ОКПД2 классификация завершена: %d/%d (не найдено: %d)", classified, totalToClassify, failed)
 }

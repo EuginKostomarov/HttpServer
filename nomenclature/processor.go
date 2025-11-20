@@ -201,8 +201,8 @@ func (p *NomenclatureProcessor) worker(id int, jobs <-chan int, results chan<- p
 	}()
 
 	for jobID := range jobs {
-		// Rate limiting
-		time.Sleep(p.config.RateLimitDelay)
+		// Rate limiting обрабатывается внутри AIClient через rate limiter
+		// Не нужна дополнительная задержка здесь
 
 		result, err := p.processSingleRecord(jobID)
 		results <- processingResult{

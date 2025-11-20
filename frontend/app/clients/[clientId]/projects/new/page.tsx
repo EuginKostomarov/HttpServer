@@ -6,17 +6,22 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { Alert, AlertDescription } from "@/components/ui/alert"
 import { 
   ArrowLeft,
-  Target 
+  Target,
+  AlertCircle
 } from "lucide-react"
 import Link from 'next/link'
+import { apiRequest, formatError } from '@/lib/api-utils'
 
 export default function NewProjectPage() {
   const params = useParams()
   const router = useRouter()
   const clientId = params.clientId
   const [isLoading, setIsLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({})
   const [formData, setFormData] = useState({
     name: '',
     project_type: 'nomenclature',
@@ -25,39 +30,77 @@ export default function NewProjectPage() {
     target_quality_score: 0.9
   })
 
+  const validateForm = (): boolean => {
+    const errors: Record<string, string> = {}
+    
+    // Валидация названия
+    if (!formData.name.trim()) {
+      errors.name = 'Название проекта обязательно для заполнения'
+    } else if (formData.name.trim().length < 3) {
+      errors.name = 'Название проекта должно содержать минимум 3 символа'
+    } else if (formData.name.trim().length > 200) {
+      errors.name = 'Название проекта не должно превышать 200 символов'
+    }
+    
+    // Валидация целевого качества
+    if (formData.target_quality_score < 0 || formData.target_quality_score > 1) {
+      errors.target_quality_score = 'Целевое качество должно быть от 0.0 до 1.0'
+    } else if (isNaN(formData.target_quality_score)) {
+      errors.target_quality_score = 'Целевое качество должно быть числом'
+    }
+    
+    // Валидация описания (опционально, но если заполнено - проверяем длину)
+    if (formData.description && formData.description.length > 1000) {
+      errors.description = 'Описание не должно превышать 1000 символов'
+    }
+    
+    // Валидация системы-источника (опционально, но если заполнено - проверяем длину)
+    if (formData.source_system && formData.source_system.length > 100) {
+      errors.source_system = 'Название системы-источника не должно превышать 100 символов'
+    }
+    
+    setFieldErrors(errors)
+    return Object.keys(errors).length === 0
+  }
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
+    setError(null)
+    
+    if (!validateForm()) {
+      return
+    }
+    
     setIsLoading(true)
     try {
-      const response = await fetch(`/api/clients/${clientId}/projects`, {
+      const newProject = await apiRequest<{ id: number }>(`/api/clients/${clientId}/projects`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
         body: JSON.stringify(formData),
       })
-
-      if (response.ok) {
-        const newProject = await response.json()
-        router.push(`/clients/${clientId}/projects/${newProject.id}`)
-      } else {
-        const errorData = await response.json()
-        throw new Error(errorData.error || 'Failed to create project')
-      }
+      router.push(`/clients/${clientId}/projects/${newProject.id}`)
     } catch (error) {
       console.error('Error creating project:', error)
-      alert(error instanceof Error ? error.message : 'Ошибка при создании проекта')
+      setError(formatError(error))
     } finally {
       setIsLoading(false)
     }
   }
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) => {
+    const fieldName = e.target.name
     const value = e.target.type === 'number' ? parseFloat(e.target.value) : e.target.value
     setFormData(prev => ({
       ...prev,
-      [e.target.name]: value
+      [fieldName]: value
     }))
+    // Очищаем ошибку поля при изменении
+    if (fieldErrors[fieldName]) {
+      setFieldErrors(prev => {
+        const newErrors = { ...prev }
+        delete newErrors[fieldName]
+        return newErrors
+      })
+    }
   }
 
   return (
@@ -88,6 +131,13 @@ export default function NewProjectPage() {
         </CardHeader>
         <CardContent>
           <form onSubmit={handleSubmit} className="space-y-6">
+            {error && (
+              <Alert variant="destructive">
+                <AlertCircle className="h-4 w-4" />
+                <AlertDescription>{error}</AlertDescription>
+              </Alert>
+            )}
+            
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
               <div className="space-y-2">
                 <Label htmlFor="name">Название проекта *</Label>
@@ -98,7 +148,11 @@ export default function NewProjectPage() {
                   onChange={handleChange}
                   placeholder="Номенклатура 2024"
                   required
+                  className={fieldErrors.name ? 'border-destructive' : ''}
                 />
+                {fieldErrors.name && (
+                  <p className="text-sm text-destructive">{fieldErrors.name}</p>
+                )}
               </div>
               <div className="space-y-2">
                 <Label htmlFor="project_type">Тип проекта *</Label>
@@ -112,6 +166,7 @@ export default function NewProjectPage() {
                 >
                   <option value="nomenclature">Номенклатура</option>
                   <option value="counterparties">Контрагенты</option>
+                  <option value="nomenclature_counterparties">Номенклатура + Контрагенты</option>
                   <option value="mixed">Смешанный</option>
                 </select>
               </div>
@@ -123,7 +178,11 @@ export default function NewProjectPage() {
                   value={formData.source_system}
                   onChange={handleChange}
                   placeholder="1C:Торговля 11.4"
+                  className={fieldErrors.source_system ? 'border-destructive' : ''}
                 />
+                {fieldErrors.source_system && (
+                  <p className="text-sm text-destructive">{fieldErrors.source_system}</p>
+                )}
               </div>
               <div className="space-y-2">
                 <Label htmlFor="target_quality_score">Целевое качество (0.0-1.0)</Label>
@@ -136,7 +195,11 @@ export default function NewProjectPage() {
                   step="0.1"
                   value={formData.target_quality_score}
                   onChange={handleChange}
+                  className={fieldErrors.target_quality_score ? 'border-destructive' : ''}
                 />
+                {fieldErrors.target_quality_score && (
+                  <p className="text-sm text-destructive">{fieldErrors.target_quality_score}</p>
+                )}
               </div>
             </div>
             <div className="space-y-2">
@@ -148,8 +211,16 @@ export default function NewProjectPage() {
                 onChange={handleChange}
                 placeholder="Описание проекта и целей нормализации..."
                 rows={3}
-                className="flex min-h-[80px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                className={`flex min-h-[80px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 ${fieldErrors.description ? 'border-destructive' : ''}`}
               />
+              {fieldErrors.description && (
+                <p className="text-sm text-destructive">{fieldErrors.description}</p>
+              )}
+              {formData.description && !fieldErrors.description && (
+                <p className="text-xs text-muted-foreground">
+                  {formData.description.length} / 1000 символов
+                </p>
+              )}
             </div>
             <div className="flex gap-4 pt-4">
               <Button type="button" variant="outline" asChild>

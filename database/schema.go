@@ -169,6 +169,11 @@ func InitSchema(db *sql.DB) error {
 		return fmt.Errorf("failed to migrate stage tracking fields: %w", err)
 	}
 
+	// Добавляем поле normalization_session_id в normalized_data
+	if err := MigrateAddSessionIdToNormalizedData(db); err != nil {
+		return fmt.Errorf("failed to migrate session ID field: %w", err)
+	}
+
 	// Создаем таблицы системы качества (DQAS)
 	if err := CreateQualityAssessmentsTables(db); err != nil {
 		return fmt.Errorf("failed to create quality assessment tables: %w", err)
@@ -484,6 +489,19 @@ func InitServiceSchema(db *sql.DB) error {
 		approved_at TIMESTAMP,
 		source_database TEXT,
 		usage_count INTEGER DEFAULT 0,
+		-- Поля для контрагентов
+		tax_id TEXT,              -- ИНН
+		kpp TEXT,                 -- КПП
+		legal_address TEXT,       -- Юридический адрес
+		postal_address TEXT,      -- Почтовый адрес
+		contact_phone TEXT,       -- Телефон
+		contact_email TEXT,       -- Email
+		contact_person TEXT,      -- Контактное лицо
+		legal_form TEXT,          -- Организационно-правовая форма (ООО, ИП и т.д.)
+		bank_name TEXT,           -- Банк
+		bank_account TEXT,         -- Расчетный счет
+		correspondent_account TEXT, -- Корреспондентский счет
+		bik TEXT,                 -- БИК
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 		FOREIGN KEY(client_project_id) REFERENCES client_projects(id) ON DELETE CASCADE
@@ -548,7 +566,26 @@ func InitServiceSchema(db *sql.DB) error {
 		metadata_json TEXT
 	);
 
-	-- Индексы для оптимизации запросов
+	-- Таблица ожидающих индексации баз данных
+	CREATE TABLE IF NOT EXISTS pending_databases (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		file_path TEXT NOT NULL UNIQUE,
+		file_name TEXT NOT NULL,
+		file_size INTEGER,
+		detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		indexing_status TEXT DEFAULT 'pending',
+		indexing_started_at TIMESTAMP,
+		indexing_completed_at TIMESTAMP,
+		error_message TEXT,
+		client_id INTEGER,
+		project_id INTEGER,
+		moved_to_uploads BOOLEAN DEFAULT FALSE,
+		original_path TEXT,
+		FOREIGN KEY(client_id) REFERENCES clients(id) ON DELETE SET NULL,
+		FOREIGN KEY(project_id) REFERENCES client_projects(id) ON DELETE SET NULL
+	);
+
+	-- Индексы для оптимизации запросов (базовые, без полей контрагентов)
 	CREATE INDEX IF NOT EXISTS idx_client_projects_client_id ON client_projects(client_id);
 	CREATE INDEX IF NOT EXISTS idx_client_benchmarks_project_id ON client_benchmarks(client_project_id);
 	CREATE INDEX IF NOT EXISTS idx_client_benchmarks_normalized_name ON client_benchmarks(normalized_name);
@@ -559,37 +596,99 @@ func InitServiceSchema(db *sql.DB) error {
 	CREATE INDEX IF NOT EXISTS idx_project_databases_active ON project_databases(is_active);
 	CREATE INDEX IF NOT EXISTS idx_database_metadata_file_path ON database_metadata(file_path);
 	CREATE INDEX IF NOT EXISTS idx_database_metadata_type ON database_metadata(database_type);
-
-	-- Таблица конфигурации воркеров и провайдеров AI
-	CREATE TABLE IF NOT EXISTS worker_config (
-		id INTEGER PRIMARY KEY CHECK (id = 1), -- Только одна конфигурация
-		config_json TEXT NOT NULL, -- JSON с полной конфигурацией (включая API ключи)
-		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-	);
-
-	-- Индекс для оптимизации
-	CREATE INDEX IF NOT EXISTS idx_worker_config_updated_at ON worker_config(updated_at);
-
-	-- Таблица классификатора КПВЭД
-	CREATE TABLE IF NOT EXISTS kpved_classifier (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		code TEXT NOT NULL UNIQUE,
-		name TEXT NOT NULL,
-		parent_code TEXT,
-		level INTEGER,
-		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-	);
-
-	-- Индексы для таблицы kpved_classifier
-	CREATE INDEX IF NOT EXISTS idx_kpved_code ON kpved_classifier(code);
-	CREATE INDEX IF NOT EXISTS idx_kpved_parent ON kpved_classifier(parent_code);
-	CREATE INDEX IF NOT EXISTS idx_kpved_level ON kpved_classifier(level);
+	CREATE INDEX IF NOT EXISTS idx_pending_databases_status ON pending_databases(indexing_status);
+	CREATE INDEX IF NOT EXISTS idx_pending_databases_file_path ON pending_databases(file_path);
+	CREATE INDEX IF NOT EXISTS idx_pending_databases_project_id ON pending_databases(project_id);
 	`
 
 	_, err := db.Exec(schema)
 	if err != nil {
-		return fmt.Errorf("failed to create service schema: %w", err)
+		return fmt.Errorf("failed to initialize service schema: %w", err)
+	}
+
+	// Выполняем миграции для сессий нормализации
+	if err := MigrateNormalizationSessions(db); err != nil {
+		return fmt.Errorf("failed to migrate normalization sessions: %w", err)
+	}
+
+	// Создаем таблицы для системы классификации в ServiceDB
+	if err := CreateClassificationTables(db); err != nil {
+		return fmt.Errorf("failed to create classification tables: %w", err)
+	}
+
+	// Выполняем миграцию для добавления полей контрагентов (для старых баз данных)
+	if err := MigrateBenchmarkCounterpartyFields(db); err != nil {
+		return fmt.Errorf("failed to migrate benchmark counterparty fields: %w", err)
+	}
+
+	// Выполняем миграцию для добавления поля source_enrichment
+	if err := MigrateCounterpartyEnrichmentSource(db); err != nil {
+		return fmt.Errorf("failed to migrate counterparty enrichment source: %w", err)
+	}
+
+	// Выполняем миграцию для добавления полей OGRN и region
+	if err := MigrateBenchmarkOGRNRegion(db); err != nil {
+		return fmt.Errorf("failed to migrate benchmark OGRN and region: %w", err)
+	}
+
+	// Выполняем миграцию для добавления поля manufacturer_benchmark_id
+	if err := MigrateBenchmarkManufacturerLink(db); err != nil {
+		return fmt.Errorf("failed to migrate benchmark manufacturer link: %w", err)
+	}
+
+	// Создаем таблицу классификатора ОКПД2 (если её нет)
+	if err := CreateOkpd2ClassifierTable(db); err != nil {
+		return fmt.Errorf("failed to create okpd2_classifier table: %w", err)
+	}
+
+	// Создаем таблицу истории бенчмарков моделей
+	benchmarkHistoryTable := `
+		CREATE TABLE IF NOT EXISTS model_benchmark_history (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			timestamp DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			model_name TEXT NOT NULL,
+			priority INTEGER NOT NULL,
+			speed REAL NOT NULL,
+			avg_response_time_ms INTEGER NOT NULL,
+			median_response_time_ms INTEGER,
+			p95_response_time_ms INTEGER,
+			min_response_time_ms INTEGER,
+			max_response_time_ms INTEGER,
+			success_count INTEGER NOT NULL,
+			error_count INTEGER NOT NULL,
+			total_requests INTEGER NOT NULL,
+			success_rate REAL NOT NULL,
+			status TEXT NOT NULL,
+			test_count INTEGER NOT NULL,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_benchmark_history_timestamp ON model_benchmark_history(timestamp);
+		CREATE INDEX IF NOT EXISTS idx_benchmark_history_model ON model_benchmark_history(model_name);
+		CREATE INDEX IF NOT EXISTS idx_benchmark_history_priority ON model_benchmark_history(priority);
+	`
+	if _, err := db.Exec(benchmarkHistoryTable); err != nil {
+		return fmt.Errorf("failed to create benchmark history table: %w", err)
+	}
+
+	// Создаем таблицы справочников
+	if err := CreateReferenceBooksTables(db); err != nil {
+		return fmt.Errorf("failed to create reference books tables: %w", err)
+	}
+
+	// Выполняем миграцию для добавления полей связи со справочниками
+	if err := MigrateBenchmarkReferenceLinks(db); err != nil {
+		return fmt.Errorf("failed to migrate benchmark reference links: %w", err)
+	}
+
+	// Создаем таблицу normalized_counterparties если её нет
+	if err := CreateNormalizedCounterpartiesTable(db); err != nil {
+		return fmt.Errorf("failed to create normalized_counterparties table: %w", err)
+	}
+
+	// Выполняем миграцию для добавления поля subcategory в normalized_counterparties
+	if err := MigrateNormalizedCounterpartiesSubcategory(db); err != nil {
+		return fmt.Errorf("failed to migrate normalized counterparties subcategory: %w", err)
 	}
 
 	return nil
@@ -636,6 +735,69 @@ func CreateKpvedClassifierTable(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_kpved_code ON kpved_classifier(code)`,
 		`CREATE INDEX IF NOT EXISTS idx_kpved_parent ON kpved_classifier(parent_code)`,
 		`CREATE INDEX IF NOT EXISTS idx_kpved_level ON kpved_classifier(level)`,
+	}
+
+	for _, indexSQL := range indexes {
+		_, err = db.Exec(indexSQL)
+		if err != nil {
+			return fmt.Errorf("failed to create index: %w", err)
+		}
+	}
+
+	// Создаем таблицу для классификатора ОКПД2
+	if err := CreateOkpd2ClassifierTable(db); err != nil {
+		return fmt.Errorf("failed to create okpd2_classifier table: %w", err)
+	}
+
+	// Создаем таблицу для классификатора КПВЭД
+	if err := CreateKpvedClassifierTable(db); err != nil {
+		return fmt.Errorf("failed to create kpved_classifier table: %w", err)
+	}
+
+	return nil
+}
+
+// CreateOkpd2ClassifierTable создает таблицу для хранения иерархии классификатора ОКПД2
+func CreateOkpd2ClassifierTable(db *sql.DB) error {
+	// Проверяем существование таблицы
+	var exists bool
+	err := db.QueryRow(`
+		SELECT EXISTS (
+			SELECT 1 FROM sqlite_master
+			WHERE type='table' AND name='okpd2_classifier'
+		)
+	`).Scan(&exists)
+	if err != nil {
+		return fmt.Errorf("failed to check okpd2_classifier table existence: %w", err)
+	}
+
+	if exists {
+		// Таблица уже существует, пропускаем создание
+		return nil
+	}
+
+	// Создаем таблицу
+	createTable := `
+		CREATE TABLE okpd2_classifier (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			code TEXT NOT NULL UNIQUE,
+			name TEXT NOT NULL,
+			parent_code TEXT,
+			level INTEGER,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		)
+	`
+
+	_, err = db.Exec(createTable)
+	if err != nil {
+		return fmt.Errorf("failed to create okpd2_classifier table: %w", err)
+	}
+
+	// Создаем индексы
+	indexes := []string{
+		`CREATE INDEX IF NOT EXISTS idx_okpd2_code ON okpd2_classifier(code)`,
+		`CREATE INDEX IF NOT EXISTS idx_okpd2_parent ON okpd2_classifier(parent_code)`,
+		`CREATE INDEX IF NOT EXISTS idx_okpd2_level ON okpd2_classifier(level)`,
 	}
 
 	for _, indexSQL := range indexes {

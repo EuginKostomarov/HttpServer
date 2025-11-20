@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Бенчмарк моделей Arliai API</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+        .container { max-width: 1400px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        h1 { color: #333; border-bottom: 3px solid #4CAF50; padding-bottom: 10px; }
+        table { width: 100%; border-collapse: collapse; margin: 20px 0; }
+        th { background: #4CAF50; color: white; padding: 12px; text-align: left; }
+        td { padding: 10px; border-bottom: 1px solid #ddd; }
+        tr:hover { background: #f9f9f9; }
+        .priority-1 { background: #d4edda !important; font-weight: bold; }
+        .priority-2 { background: #fff3cd; }
+        .status-ok { color: #28a745; }
+        .status-warning { color: #ffc107; }
+        .status-failed { color: #dc3545; }
+        .speed-bar { background: #e0e0e0; height: 20px; border-radius: 10px; position: relative; }
+        .speed-fill { background: linear-gradient(90deg, #4CAF50, #8BC34A); height: 100%; border-radius: 10px; }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; margin: 20px 0; }
+        .stat-card { background: #f8f9fa; padding: 15px; border-radius: 8px; border-left: 4px solid #4CAF50; }
+        .stat-value { font-size: 24px; font-weight: bold; color: #4CAF50; }
+        .stat-label { color: #666; font-size: 14px; margin-top: 5px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🏆 Бенчмарк моделей Arliai API</h1>
+        <p><strong>Дата тестирования:</strong> 2025-11-20 20:18:13</p>
+        
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-value">2</div>
+                <div class="stat-label">Всего моделей</div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-value">Gemma-3-27B-ArliAI-RPMax-v3</div>
+                <div class="stat-label">Самая быстрая модель</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">0.32 req/s</div>
+                <div class="stat-label">Максимальная скорость</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">3.139s</div>
+                <div class="stat-label">Среднее время ответа</div>
+            </div>
+
+        </div>
+
+        <h2>Таблица результатов</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Модель</th>
+                    <th>Приоритет</th>
+                    <th>Скорость (req/s)</th>
+                    <th>Среднее время</th>
+                    <th>Медиана</th>
+                    <th>P95</th>
+                    <th>Успешно</th>
+                    <th>Ошибок</th>
+                    <th>Успешность</th>
+                    <th>Статус</th>
+                </tr>
+            </thead>
+            <tbody>
+
+                <tr class="priority-1">
+                    <td><strong>Gemma-3-27B-ArliAI-RPMax-v3</strong></td>
+                    <td>1</td>
+                    <td>
+                        <div class="speed-bar">
+                            <div class="speed-fill" style="width: 100.0%"></div>
+                        </div>
+                        <span style="margin-left: 10px;">0.32</span>
+                    </td>
+                    <td>3.139s</td>
+                    <td>8ms</td>
+                    <td>16ms</td>
+                    <td>11</td>
+                    <td>4</td>
+                    <td>73.3%</td>
+                    <td class="status-warning">✓ OK</td>
+                </tr>
+
+                <tr class="priority-2">
+                    <td><strong>GLM-4.5-Air</strong></td>
+                    <td>2</td>
+                    <td>
+                        <div class="speed-bar">
+                            <div class="speed-fill" style="width: 80.9%"></div>
+                        </div>
+                        <span style="margin-left: 10px;">0.26</span>
+                    </td>
+                    <td>3.878s</td>
+                    <td>9ms</td>
+                    <td>11ms</td>
+                    <td>11</td>
+                    <td>4</td>
+                    <td>73.3%</td>
+                    <td class="status-warning">✓ OK</td>
+                </tr>
+
+            </tbody>
+        </table>
+
+        <h2>Рекомендации</h2>
+        <div style="background: #e7f3ff; padding: 15px; border-radius: 8px; margin-top: 20px;">
+
+            <h3>🏆 Самая быстрая модель: Gemma-3-27B-ArliAI-RPMax-v3</h3>
+            <p><strong>Скорость:</strong> 0.32 запросов/сек</p>
+            <p><strong>Среднее время ответа:</strong> 3.139s</p>
+            <p><strong>Успешность:</strong> 73.3%</p>
+            <h4>Рекомендуемая конфигурация:</h4>
+            <pre style="background: #f5f5f5; padding: 10px; border-radius: 4px;">
+ARLIAI_MODEL=Gemma-3-27B-ArliAI-RPMax-v3
+MaxWorkers=2
+RateLimit=2.0
+</pre>
+
+        </div>
+    </div>
+</body>
+</html>
