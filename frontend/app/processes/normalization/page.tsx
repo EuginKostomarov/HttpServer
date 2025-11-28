@@ -14,12 +14,30 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { FadeIn } from '@/components/animations/fade-in'
 import { motion } from 'framer-motion'
+import { EnhancedPreviewTable } from '@/components/processes/enhanced-preview-table'
+import { DataTraceabilityPanel } from '@/components/processes/data-traceability-panel'
+import { NomenclatureTabContent } from '@/components/processes/nomenclature-tab-content'
+import { CounterpartiesTabContent } from '@/components/processes/counterparties-tab-content'
+import type { EnhancedGroup, PreviewStatsResponse } from '@/types/normalization'
+
+interface ProjectDatabase {
+  id: number
+  name: string
+  nomenclature_count?: number
+  counterparties_count?: number
+  record_count?: number
+}
 
 export default function NormalizationProcessesPage() {
   const [activeTab, setActiveTab] = useState<'overview' | 'nomenclature' | 'counterparties'>('overview')
   const [selectedProject, setSelectedProject] = useState<string>('')
   const [clientId, setClientId] = useState<number | null>(null)
   const [projectId, setProjectId] = useState<number | null>(null)
+  const [selectedGroup, setSelectedGroup] = useState<EnhancedGroup | null>(null)
+  const [databases, setDatabases] = useState<ProjectDatabase[]>([])
+  const [nomenclatureCount, setNomenclatureCount] = useState<number | undefined>(undefined)
+  const [counterpartiesCount, setCounterpartiesCount] = useState<number | undefined>(undefined)
+  const [previewStats, setPreviewStats] = useState<PreviewStatsResponse | null>(null)
   
   // Обновляем clientId и projectId при изменении selectedProject
   useEffect(() => {
@@ -44,6 +62,50 @@ export default function NormalizationProcessesPage() {
       setProjectId(null)
     }
   }, [selectedProject])
+
+  // Загрузка списка баз данных проекта
+  useEffect(() => {
+    const loadDatabases = async () => {
+      if (!clientId || !projectId) {
+        setDatabases([])
+        return
+      }
+
+      try {
+        const response = await fetch(
+          `/api/clients/${clientId}/projects/${projectId}/databases?active_only=true`
+        )
+        if (response.ok) {
+          const data = await response.json()
+          const dbList = (data.databases || []).map((db: any) => ({
+            id: db.id,
+            name: db.name,
+            nomenclature_count: db.nomenclature_count,
+            counterparties_count: db.counterparties_count,
+            record_count: db.record_count,
+          }))
+          setDatabases(dbList)
+
+          // Подсчитываем общее количество записей
+          const totalNomenclature = dbList.reduce(
+            (sum: number, db: ProjectDatabase) => sum + (db.nomenclature_count || 0),
+            0
+          )
+          const totalCounterparties = dbList.reduce(
+            (sum: number, db: ProjectDatabase) => sum + (db.counterparties_count || 0),
+            0
+          )
+          setNomenclatureCount(totalNomenclature)
+          setCounterpartiesCount(totalCounterparties)
+        }
+      } catch (err) {
+        console.error('Failed to load databases:', err)
+        setDatabases([])
+      }
+    }
+
+    loadDatabases()
+  }, [clientId, projectId])
   
   const breadcrumbItems = [
     { label: 'Процессы', href: '/processes', icon: PlayCircle },
@@ -104,6 +166,7 @@ export default function NormalizationProcessesPage() {
           <NormalizationPreviewStats
             clientId={clientId}
             projectId={projectId}
+            onFullStatsUpdate={(stats) => setPreviewStats(stats)}
           />
         </FadeIn>
       )}
@@ -172,77 +235,169 @@ export default function NormalizationProcessesPage() {
         </TabsContent>
 
         <TabsContent value="nomenclature" className="space-y-6">
-          <NormalizationProcessCard
-            title="Нормализация номенклатуры"
-            description="Обработка и нормализация товаров и услуг"
-            statusEndpoint={clientId && projectId 
-              ? `/api/clients/${clientId}/projects/${projectId}/normalization/status`
-              : "/api/normalization/status"}
-            startEndpoint={clientId && projectId
-              ? `/api/clients/${clientId}/projects/${projectId}/normalization/start`
-              : "/api/normalization/start"}
-            stopEndpoint="/api/normalization/stop"
-            detailPagePath="/processes/nomenclature"
-            icon={<Package className="h-6 w-6" />}
-            clientId={clientId}
-            projectId={projectId}
-          />
+          {!clientId || !projectId ? (
+            <div className="p-4 bg-yellow-50 dark:bg-yellow-950 border border-yellow-200 dark:border-yellow-800 rounded-lg">
+              <p className="text-sm text-yellow-800 dark:text-yellow-200">
+                <strong>Внимание:</strong> Для просмотра данных нормализации выберите проект выше.
+              </p>
+            </div>
+          ) : (
+            <>
+              <NomenclatureTabContent
+                clientId={clientId}
+                projectId={projectId}
+                databases={
+                  previewStats?.databases?.map((db) => ({
+                    id: db.database_id,
+                    name: db.database_name,
+                    nomenclature_count: db.nomenclature_count,
+                    record_count: db.nomenclature_count,
+                  })) || databases
+                }
+                recordCount={previewStats?.total_nomenclature || nomenclatureCount}
+              />
 
-          <NormalizationStats 
-            type="nomenclature" 
-            clientId={clientId}
-            projectId={projectId}
-          />
-          
-          <NormalizationPerformanceCharts 
-            type="nomenclature" 
-            clientId={clientId}
-            projectId={projectId}
-          />
-          
-          <NormalizationHistory 
-            type="nomenclature" 
-            clientId={clientId}
-            projectId={projectId}
-            limit={10} 
-          />
+              {/* Разделитель между секциями */}
+              <div className="relative my-8">
+                <div className="absolute inset-0 flex items-center">
+                  <span className="w-full border-t" />
+                </div>
+                <div className="relative flex justify-center text-xs uppercase">
+                  <span className="bg-background px-2 text-muted-foreground">
+                    Нормализованные данные
+                  </span>
+                </div>
+              </div>
+
+              <NormalizationStats 
+                type="nomenclature" 
+                clientId={clientId}
+                projectId={projectId}
+              />
+              
+              <NormalizationPerformanceCharts 
+                type="nomenclature" 
+                clientId={clientId}
+                projectId={projectId}
+              />
+
+              <div className="space-y-4">
+                <div>
+                  <h2 className="text-2xl font-bold mb-2">Нормализованные группы</h2>
+                  <p className="text-muted-foreground">
+                    Просмотр сгруппированных и нормализованных записей номенклатуры после обработки
+                  </p>
+                </div>
+                <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
+                  <div className="xl:col-span-2">
+                    <EnhancedPreviewTable
+                      dataType="nomenclature"
+                      projectId={projectId}
+                      onItemSelect={setSelectedGroup}
+                    />
+                  </div>
+                  <div className="space-y-6">
+                    {selectedGroup && (
+                      <DataTraceabilityPanel
+                        group={selectedGroup}
+                        projectId={projectId}
+                      />
+                    )}
+                  </div>
+                </div>
+              </div>
+              
+              <NormalizationHistory 
+                type="nomenclature" 
+                clientId={clientId}
+                projectId={projectId}
+                limit={10} 
+              />
+            </>
+          )}
         </TabsContent>
 
         <TabsContent value="counterparties" className="space-y-6">
-          <NormalizationProcessCard
-            title="Нормализация контрагентов"
-            description="Обработка и нормализация данных контрагентов"
-            statusEndpoint={clientId && projectId
-              ? `/api/counterparties/normalization/status?client_id=${clientId}&project_id=${projectId}`
-              : "/api/counterparties/normalization/status"}
-            startEndpoint={clientId && projectId
-              ? `/api/counterparties/normalization/start?client_id=${clientId}&project_id=${projectId}`
-              : "/api/counterparties/normalization/start"}
-            stopEndpoint="/api/counterparties/normalization/stop"
-            detailPagePath="/processes/counterparties"
-            icon={<Building2 className="h-6 w-6" />}
-            clientId={clientId}
-            projectId={projectId}
-          />
+          {!clientId || !projectId ? (
+            <div className="p-4 bg-yellow-50 dark:bg-yellow-950 border border-yellow-200 dark:border-yellow-800 rounded-lg">
+              <p className="text-sm text-yellow-800 dark:text-yellow-200">
+                <strong>Внимание:</strong> Для просмотра данных нормализации выберите проект выше.
+              </p>
+            </div>
+          ) : (
+            <>
+              <CounterpartiesTabContent
+                clientId={clientId}
+                projectId={projectId}
+                databases={
+                  previewStats?.databases?.map((db) => ({
+                    id: db.database_id,
+                    name: db.database_name,
+                    counterparties_count: db.counterparty_count,
+                    record_count: db.counterparty_count,
+                  })) || databases
+                }
+                recordCount={previewStats?.total_counterparties || counterpartiesCount}
+              />
 
-          <NormalizationStats 
-            type="counterparties" 
-            clientId={clientId}
-            projectId={projectId}
-          />
-          
-          <NormalizationPerformanceCharts 
-            type="counterparties" 
-            clientId={clientId}
-            projectId={projectId}
-          />
-          
-          <NormalizationHistory 
-            type="counterparties" 
-            clientId={clientId}
-            projectId={projectId}
-            limit={10} 
-          />
+              {/* Разделитель между секциями */}
+              <div className="relative my-8">
+                <div className="absolute inset-0 flex items-center">
+                  <span className="w-full border-t" />
+                </div>
+                <div className="relative flex justify-center text-xs uppercase">
+                  <span className="bg-background px-2 text-muted-foreground">
+                    Нормализованные данные
+                  </span>
+                </div>
+              </div>
+
+              <NormalizationStats 
+                type="counterparties" 
+                clientId={clientId}
+                projectId={projectId}
+              />
+              
+              <NormalizationPerformanceCharts 
+                type="counterparties" 
+                clientId={clientId}
+                projectId={projectId}
+              />
+
+              <div className="space-y-4">
+                <div>
+                  <h2 className="text-2xl font-bold mb-2">Нормализованные группы</h2>
+                  <p className="text-muted-foreground">
+                    Просмотр сгруппированных и нормализованных записей контрагентов после обработки
+                  </p>
+                </div>
+                <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
+                  <div className="xl:col-span-2">
+                    <EnhancedPreviewTable
+                      dataType="counterparties"
+                      projectId={projectId}
+                      onItemSelect={setSelectedGroup}
+                    />
+                  </div>
+                  <div className="space-y-6">
+                    {selectedGroup && (
+                      <DataTraceabilityPanel
+                        group={selectedGroup}
+                        projectId={projectId}
+                      />
+                    )}
+                  </div>
+                </div>
+              </div>
+              
+              <NormalizationHistory 
+                type="counterparties" 
+                clientId={clientId}
+                projectId={projectId}
+                limit={10} 
+              />
+            </>
+          )}
         </TabsContent>
       </Tabs>
 
